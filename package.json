@@ -1,15 +1,16 @@
 {
-  "name": "factflow",
+  "name": "recto",
   "version": "1.0.0",
-  "description": "A TikTok-style vertical scroll feed that generates interesting, true facts on the fly using the Claude API. The backend keeps a running buffer of cards so the user is always scrolling ~25 items behind a pre-generated queue.",
-  "main": "server.js",
+  "description": "Recto — flashcards simples pour réviser ses cours sur le téléphone (PWA hors ligne).",
+  "private": true,
   "type": "module",
   "scripts": {
-    "start": "node server.js"
+    "start": "node scripts/serve.mjs",
+    "test": "node --test \"tests/unit/*.test.mjs\"",
+    "e2e": "node tests/e2e/run.mjs",
+    "icons": "node scripts/make-icons.mjs"
   },
-  "dependencies": {
-    "@anthropic-ai/sdk": "^0.32.0",
-    "dotenv": "^16.4.5",
-    "express": "^4.19.2"
+  "engines": {
+    "node": ">=22"
   }
 }

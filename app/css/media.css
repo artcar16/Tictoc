@@ -1,0 +1,699 @@
+/* Recto — media overlays (photo cropper, audio recorder) and the round audio button.
+   Injected by js/media.js. Uses the design tokens of style.css, with fallbacks so it also
+   works on its own. Overlays sit at z-index 1000 (above sheets, below toasts). */
+
+html.media-lock,
+html.media-lock body {
+  overflow: hidden !important;
+  overscroll-behavior: none;
+}
+
+/* ------------------------------------------------------------------ */
+/* Shared overlay shell                                                */
+/* ------------------------------------------------------------------ */
+
+.media-overlay {
+  position: fixed;
+  top: 0;
+  right: 0;
+  left: 0;
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  height: 100dvh;
+  padding: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px) env(safe-area-inset-bottom, 0px)
+    env(safe-area-inset-left, 0px);
+  font-family: var(--font, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif);
+  line-height: 1.4;
+  -webkit-tap-highlight-color: transparent;
+  -webkit-text-size-adjust: 100%;
+  touch-action: manipulation;
+  overscroll-behavior: contain;
+  outline: none;
+  animation: media-overlay-in 0.18s ease-out;
+}
+
+.media-overlay *,
+.media-overlay *::before,
+.media-overlay *::after {
+  box-sizing: border-box;
+}
+
+.media-overlay [hidden] {
+  display: none !important;
+}
+
+@keyframes media-overlay-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.mo-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 52px;
+  padding: 4px 8px;
+}
+
+.mo-title {
+  flex: 1;
+  margin: 0;
+  font-size: 17px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mo-spacer {
+  flex: none;
+  width: 44px;
+}
+
+.mo-icon {
+  flex: none;
+  width: 22px;
+  height: 22px;
+}
+
+.mo-icon-btn {
+  appearance: none;
+  flex: none;
+  display: inline-grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.mo-foot {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 100%;
+  max-width: 600px;
+  margin: 0 auto;
+  padding: 8px 16px 14px;
+}
+
+.mo-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.mo-btn {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 50px;
+  margin: 0;
+  padding: 0 18px;
+  border: 0;
+  border-radius: var(--radius, 14px);
+  font: inherit;
+  font-size: 16px;
+  font-weight: 600;
+  line-height: 1.2;
+  text-align: center;
+  cursor: pointer;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: manipulation;
+  transition:
+    background-color 0.15s,
+    opacity 0.15s,
+    transform 0.1s;
+}
+
+.mo-btn:active:not(:disabled) {
+  transform: scale(0.98);
+}
+
+.mo-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.mo-btn-primary {
+  background: var(--accent, #3b5bdb);
+  color: var(--accent-text, #ffffff);
+}
+
+.mo-btn-secondary {
+  background: var(--surface-2, #efefeb);
+  color: var(--text, #1c1c1e);
+}
+
+.mo-btn-link {
+  min-height: 44px;
+  background: transparent;
+  color: var(--accent, #3b5bdb);
+  font-weight: 500;
+}
+
+.mo-error {
+  margin: 0;
+  font-size: 15px;
+  text-align: center;
+}
+
+.media-overlay :focus-visible {
+  outline: 2px solid var(--accent, #3b5bdb);
+  outline-offset: 2px;
+}
+
+/* ------------------------------------------------------------------ */
+/* Cropper (always dark, like a photo viewer)                          */
+/* ------------------------------------------------------------------ */
+
+.media-cropper {
+  background: #000000;
+  color: #f4f4f5;
+  color-scheme: dark;
+}
+
+.media-cropper .mo-btn-secondary {
+  background: rgba(255, 255, 255, 0.12);
+  color: #f4f4f5;
+}
+
+.media-cropper :focus-visible {
+  outline-color: #ffffff;
+}
+
+.mc-stage {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+}
+
+.mc-canvas {
+  position: absolute;
+  top: 0;
+  left: 0;
+  display: block;
+  pointer-events: none;
+}
+
+/* The crop box: transparent window, everything around it darkened by a huge shadow. */
+.mc-box {
+  position: absolute;
+  top: 0;
+  left: 0;
+  /* 100vmax always covers the stage; no will-change: a layer this large is costly on iOS. */
+  box-shadow: 0 0 0 100vmax rgba(0, 0, 0, 0.6);
+  pointer-events: none;
+  outline: none;
+}
+
+.mc-box::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border: 1px solid rgba(255, 255, 255, 0.9);
+}
+
+.mc-box:focus-visible::before {
+  border: 2px solid var(--accent, #3b5bdb);
+}
+
+/* Rule-of-thirds guides, shown while dragging. */
+.mc-grid {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+.mc-grid i {
+  position: absolute;
+  background: rgba(255, 255, 255, 0.45);
+}
+
+.mc-grid i:nth-child(1),
+.mc-grid i:nth-child(2) {
+  top: 0;
+  bottom: 0;
+  width: 1px;
+}
+
+.mc-grid i:nth-child(1) {
+  left: 33.333%;
+}
+
+.mc-grid i:nth-child(2) {
+  left: 66.666%;
+}
+
+.mc-grid i:nth-child(3),
+.mc-grid i:nth-child(4) {
+  left: 0;
+  right: 0;
+  height: 1px;
+}
+
+.mc-grid i:nth-child(3) {
+  top: 33.333%;
+}
+
+.mc-grid i:nth-child(4) {
+  top: 66.666%;
+}
+
+.media-cropper.is-dragging .mc-grid {
+  opacity: 1;
+}
+
+/* Handles are visual only: hit-testing (44px targets) is done in JS on the stage. */
+.mc-h {
+  position: absolute;
+  pointer-events: none;
+}
+
+.mc-h-corner {
+  width: 22px;
+  height: 22px;
+  border: 0 solid #ffffff;
+}
+
+.mc-h-nw {
+  top: -3px;
+  left: -3px;
+  border-top-width: 3px;
+  border-left-width: 3px;
+}
+
+.mc-h-ne {
+  top: -3px;
+  right: -3px;
+  border-top-width: 3px;
+  border-right-width: 3px;
+}
+
+.mc-h-se {
+  right: -3px;
+  bottom: -3px;
+  border-right-width: 3px;
+  border-bottom-width: 3px;
+}
+
+.mc-h-sw {
+  bottom: -3px;
+  left: -3px;
+  border-bottom-width: 3px;
+  border-left-width: 3px;
+}
+
+.mc-h-edge {
+  border-radius: 2px;
+  background: #ffffff;
+}
+
+.mc-h-n,
+.mc-h-s {
+  left: 50%;
+  width: 26px;
+  height: 4px;
+  margin-left: -13px;
+}
+
+.mc-h-n {
+  top: -2.5px;
+}
+
+.mc-h-s {
+  bottom: -2.5px;
+}
+
+.mc-h-e,
+.mc-h-w {
+  top: 50%;
+  width: 4px;
+  height: 26px;
+  margin-top: -13px;
+}
+
+.mc-h-e {
+  right: -2.5px;
+}
+
+.mc-h-w {
+  left: -2.5px;
+}
+
+.mc-box.is-small .mc-h-edge {
+  display: none;
+}
+
+.mc-foot {
+  padding-top: 6px;
+}
+
+.mc-tools {
+  display: flex;
+  justify-content: center;
+  gap: 8px;
+}
+
+.mo-tool {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 44px;
+  margin: 0;
+  padding: 0 16px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 15px;
+  font-weight: 500;
+  cursor: pointer;
+  touch-action: manipulation;
+  transition:
+    background-color 0.15s,
+    opacity 0.15s;
+}
+
+.mo-tool:active:not(:disabled) {
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.mo-tool:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.mc-error {
+  color: #ff8a65;
+}
+
+.media-cropper.is-busy .mc-stage {
+  pointer-events: none;
+}
+
+@media (hover: hover) {
+  .mo-tool:hover:not(:disabled) {
+    background: rgba(255, 255, 255, 0.08);
+  }
+  .mo-icon-btn:hover {
+    background: var(--surface-2, rgba(127, 127, 127, 0.12));
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Audio recorder (follows the app theme)                              */
+/* ------------------------------------------------------------------ */
+
+.media-recorder {
+  background: var(--bg, #f6f6f4);
+  color: var(--text, #1c1c1e);
+}
+
+.mr-main {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 16px;
+  overflow-y: auto;
+  text-align: center;
+}
+
+.mr-timer {
+  font-size: 48px;
+  font-weight: 300;
+  line-height: 1.1;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+}
+
+.mr-limit {
+  margin-top: -4px;
+  color: var(--text-muted, #6b6b70);
+  font-size: 14px;
+}
+
+.mr-center {
+  display: grid;
+  place-items: center;
+  width: 120px;
+  height: 120px;
+  margin: 14px 0 6px;
+}
+
+.mr-rec {
+  appearance: none;
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 92px;
+  height: 92px;
+  margin: 0;
+  padding: 0;
+  border: 3px solid var(--border-strong, #cfcfca);
+  border-radius: 50%;
+  background: var(--surface, #ffffff);
+  cursor: pointer;
+  touch-action: manipulation;
+  box-shadow: var(--shadow, 0 6px 20px rgba(20, 20, 30, 0.06));
+}
+
+.mr-rec:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.mr-rec-dot {
+  display: block;
+  width: 62px;
+  height: 62px;
+  border-radius: 50%;
+  background: var(--danger, #d9480f);
+  transition:
+    width 0.2s ease,
+    height 0.2s ease,
+    border-radius 0.2s ease;
+}
+
+.mr-rec.is-recording .mr-rec-dot {
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+}
+
+.mr-rec.is-recording::after {
+  content: '';
+  position: absolute;
+  inset: -9px;
+  border: 2px solid var(--danger, #d9480f);
+  border-radius: 50%;
+  opacity: 0;
+  animation: media-rec-pulse 1.6s ease-out infinite;
+  pointer-events: none;
+}
+
+@keyframes media-rec-pulse {
+  0% {
+    transform: scale(0.92);
+    opacity: 0.55;
+  }
+  100% {
+    transform: scale(1.15);
+    opacity: 0;
+  }
+}
+
+.mr-off {
+  display: grid;
+  place-items: center;
+  width: 92px;
+  height: 92px;
+  border-radius: 50%;
+  background: var(--surface-2, #efefeb);
+  color: var(--text-muted, #6b6b70);
+}
+
+.mr-off .mo-icon {
+  width: 36px;
+  height: 36px;
+}
+
+.mr-preview {
+  display: grid;
+  place-items: center;
+}
+
+.mr-status {
+  max-width: 340px;
+  min-height: 1.4em;
+  margin: 0;
+  color: var(--text-muted, #6b6b70);
+  font-size: 15px;
+  overflow-wrap: anywhere;
+}
+
+.mr-error {
+  max-width: 360px;
+  padding: 10px 14px;
+  border-radius: var(--radius-sm, 10px);
+  background: var(--danger-soft, rgba(217, 72, 15, 0.1));
+  color: var(--danger-text, #b83c0c);
+  text-align: left;
+}
+
+.mr-foot {
+  padding-top: 4px;
+}
+
+/* ------------------------------------------------------------------ */
+/* Round audio play/pause button                                       */
+/* ------------------------------------------------------------------ */
+
+.media-audio-btn {
+  --mab-size: var(--media-audio-size, 56px);
+  appearance: none;
+  position: relative;
+  flex: none;
+  display: inline-grid;
+  place-items: center;
+  width: var(--mab-size);
+  height: var(--mab-size);
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: var(--accent-soft, rgba(59, 91, 219, 0.1));
+  color: var(--accent, #3b5bdb);
+  cursor: pointer;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+  transition:
+    background-color 0.15s,
+    color 0.15s,
+    transform 0.1s;
+}
+
+.media-audio-btn:active:not(:disabled) {
+  transform: scale(0.95);
+}
+
+.media-audio-btn:focus-visible {
+  outline: 2px solid var(--accent, #3b5bdb);
+  outline-offset: 2px;
+}
+
+.media-audio-btn .mab-icon {
+  grid-area: 1 / 1;
+  width: 42%;
+  height: 42%;
+  pointer-events: none;
+}
+
+.media-audio-btn .mab-play {
+  margin-left: 6%; /* optical centring of the triangle */
+}
+
+.media-audio-btn .mab-pause,
+.media-audio-btn.is-playing .mab-play {
+  display: none;
+}
+
+.media-audio-btn.is-playing .mab-pause {
+  display: block;
+}
+
+.media-audio-btn.is-playing {
+  background: var(--accent, #3b5bdb);
+  color: var(--accent-text, #ffffff);
+}
+
+.mab-ring {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  transform: rotate(-90deg);
+  pointer-events: none;
+}
+
+.mab-ring circle {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  opacity: 0;
+  transition:
+    stroke-dashoffset 0.25s linear,
+    opacity 0.2s;
+}
+
+.media-audio-btn.is-playing .mab-ring circle {
+  opacity: 0.9;
+}
+
+.media-audio-btn.is-error,
+.media-audio-btn:disabled {
+  background: var(--surface-2, #efefeb);
+  color: var(--text-muted, #6b6b70);
+}
+
+.media-audio-btn:disabled {
+  cursor: default;
+}
+
+.media-audio-btn.is-large {
+  --mab-size: 92px;
+}
+
+/* ------------------------------------------------------------------ */
+/* Reduced motion                                                      */
+/* ------------------------------------------------------------------ */
+
+@media (prefers-reduced-motion: reduce) {
+  .media-overlay {
+    animation: none;
+  }
+  .mr-rec.is-recording::after {
+    animation: none;
+    opacity: 0.4;
+  }
+  .mr-rec-dot,
+  .mc-grid,
+  .mab-ring circle,
+  .media-audio-btn,
+  .mo-btn,
+  .mo-tool {
+    transition: none;
+  }
+}
