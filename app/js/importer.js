@@ -283,12 +283,19 @@ class Parser {
 /* Text pre-processing & JSON repair                                        */
 /* ------------------------------------------------------------------------ */
 
+/** Trim a { text, offset } candidate while keeping the offset accurate. */
+function trimCandidate(candidate) {
+  const lead = candidate.text.length - candidate.text.trimStart().length;
+  return { text: candidate.text.trim(), offset: candidate.offset + lead };
+}
+
 /**
- * Extract the JSON part of a pasted text: content of the first markdown code fence when present,
- * otherwise the span from the first { / [ to the last } / ] when the text has prose around it.
- * Returns { text, offset } where offset is the position of `text` inside the input.
+ * Extract the JSON part(s) of a pasted text: the content of every markdown code fence that holds
+ * JSON (an AI may split its answer into several blocks), otherwise the span from the first { / [
+ * to the last } / ] when the text has prose around it.
+ * Returns [{ text, offset }] where offset is the position of `text` inside the input.
  */
-function extractCandidate(input) {
+function extractCandidates(input) {
   // Opening fence: ``` + optional info string (json, JSON…) + optional line break.
   const openRe = /```[\w+-]*[ \t]*\r?\n?/g;
   const fences = [];
@@ -301,25 +308,34 @@ function extractCandidate(input) {
     if (close < 0) break;
     openRe.lastIndex = close + 3;
   }
-  let candidate = { text: input, offset: 0 };
   if (fences.length) {
-    candidate = fences.find((f) => /^\s*[[{]/.test(f.text)) || fences[0];
-  } else {
-    const trimmed = input.trim();
-    if (trimmed && !/^[[{]/.test(trimmed)) {
-      const start = input.search(/[[{]/);
-      const end = Math.max(input.lastIndexOf('}'), input.lastIndexOf(']'));
-      if (start >= 0 && end > start) candidate = { text: input.slice(start, end + 1), offset: start };
-    }
+    const json = fences.filter((f) => /^\s*[[{]/.test(f.text));
+    return (json.length ? json : [fences[0]]).map(trimCandidate);
   }
-  // Trim while keeping the offset accurate.
-  const lead = candidate.text.length - candidate.text.trimStart().length;
-  return { text: candidate.text.trim(), offset: candidate.offset + lead };
+  let candidate = { text: input, offset: 0 };
+  const trimmed = input.trim();
+  if (trimmed && !/^[[{]/.test(trimmed)) {
+    const start = input.search(/[[{]/);
+    const end = Math.max(input.lastIndexOf('}'), input.lastIndexOf(']'));
+    if (start >= 0 && end > start) candidate = { text: input.slice(start, end + 1), offset: start };
+  }
+  return [trimCandidate(candidate)];
 }
 
-/** Replace the characters in [from, to) with spaces (newlines kept) so that positions are preserved. */
-function blank(chars, from, to) {
-  for (let i = from; i < to; i++) if (chars[i] !== '\n') chars[i] = ' ';
+/**
+ * `text` with the ranges [from, to) replaced by spaces (newlines kept) so that positions are
+ * preserved. Built from slices: no per-character array, even for a very large text.
+ */
+function blankRanges(text, ranges) {
+  if (!ranges.length) return text;
+  const parts = [];
+  let at = 0;
+  for (const [from, to] of ranges) {
+    parts.push(text.slice(at, from), text.slice(from, to).replace(/[^\n]/g, ' '));
+    at = to;
+  }
+  parts.push(text.slice(at));
+  return parts.join('');
 }
 
 /**
@@ -327,33 +343,35 @@ function blank(chars, from, to) {
  * Removed characters are replaced by spaces: positions stay identical to the input.
  */
 function cleanJson(text) {
-  const chars = text.split('');
   // Pass 1: comments.
+  const comments = [];
   let inStr = false;
-  for (let i = 0; i < chars.length; i++) {
-    const c = chars[i];
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
     if (inStr) {
       if (c === '\\') i++;
       else if (c === '"' || c === '\n') inStr = false;
       continue;
     }
     if (c === '"') inStr = true;
-    else if (c === '/' && chars[i + 1] === '/') {
-      let j = i;
-      while (j < chars.length && chars[j] !== '\n') j++;
-      blank(chars, i, j);
+    else if (c === '/' && text[i + 1] === '/') {
+      const nl = text.indexOf('\n', i);
+      const j = nl < 0 ? text.length : nl;
+      comments.push([i, j]);
       i = j;
-    } else if (c === '/' && chars[i + 1] === '*') {
+    } else if (c === '/' && text[i + 1] === '*') {
       const end = text.indexOf('*/', i + 2);
-      const j = end < 0 ? chars.length : end + 2;
-      blank(chars, i, j);
+      const j = end < 0 ? text.length : end + 2;
+      comments.push([i, j]);
       i = j - 1;
     }
   }
+  const noComments = blankRanges(text, comments);
   // Pass 2: trailing commas.
+  const commas = [];
   inStr = false;
-  for (let i = 0; i < chars.length; i++) {
-    const c = chars[i];
+  for (let i = 0; i < noComments.length; i++) {
+    const c = noComments[i];
     if (inStr) {
       if (c === '\\') i++;
       else if (c === '"' || c === '\n') inStr = false;
@@ -362,11 +380,11 @@ function cleanJson(text) {
     if (c === '"') inStr = true;
     else if (c === ',') {
       let j = i + 1;
-      while (j < chars.length && /\s/.test(chars[j])) j++;
-      if (chars[j] === '}' || chars[j] === ']') chars[i] = ' ';
+      while (j < noComments.length && /\s/.test(noComments[j])) j++;
+      if (noComments[j] === '}' || noComments[j] === ']') commas.push([i, i + 1]);
     }
   }
-  return chars.join('');
+  return blankRanges(noComments, commas);
 }
 
 const TYPO_QUOTES = /[\u201C\u201D\u201E]/;
@@ -570,8 +588,80 @@ function enginePosition(error, text) {
 /* ------------------------------------------------------------------------ */
 
 /** True when a parsed value is a Recto backup rather than an import file. */
-function looksLikeBackup(data) {
+export function isBackupObject(data) {
   return isPlainObject(data) && (data.kind === 'backup' || (data.app === 'recto' && 'media' in data));
+}
+
+const TRAILING_REASON = 'contenu en trop après la fin du JSON';
+/** Start of another JSON block ({"…", {}, [{…, ["…, [[…, []), as opposed to prose such as « (voir [1]) ». */
+const JSON_BLOCK_START = /^(?:\{\s*["}]|\[\s*[[{"\]])/;
+
+/**
+ * Parse one candidate, with the tolerated repairs. A complete JSON value followed by text (an AI's
+ * closing question, another block…) is accepted: `end` is then the position where the value ends.
+ * → { ok: true, value, end } | { ok: false, error }  (error positions refer to `input`)
+ */
+function parseCandidate(candidate, input) {
+  const { text } = candidate;
+  // Valid JSON (the usual case, and big files): no repaired copies of the text are built.
+  let parsed = tryParse(text);
+  if (parsed.ok) return { ok: true, value: parsed.value, end: text.length };
+  const attempts = [text, cleanJson(text)];
+  if (TYPO_QUOTES.test(text)) attempts.push(cleanJson(fixDelimiterQuotes(text)), cleanJson(fixAllQuotes(text)));
+  for (const attempt of attempts.slice(1)) {
+    parsed = tryParse(attempt);
+    if (parsed.ok) return { ok: true, value: parsed.value, end: text.length };
+  }
+  // Only a complete value followed by text that does not continue it (« Veux-tu la suite ? »):
+  // an extra « } » / « ] » / « , » is a real mistake inside the JSON and is reported below.
+  for (const attempt of attempts.slice(1)) {
+    const found = findJsonError(attempt);
+    if (!found || found.reason !== TRAILING_REASON) continue;
+    if (/^\s*[,:\]}"]/.test(text.slice(found.pos))) continue;
+    const head = tryParse(attempt.slice(0, found.pos));
+    if (head.ok) return { ok: true, value: head.value, end: found.pos };
+  }
+  // Report on the most "repaired" position-preserving variant, so tolerated issues are not reported.
+  const reference = attempts[attempts.length > 2 ? 2 : 1];
+  const found = findJsonError(reference);
+  let pos = found ? found.pos : enginePosition(parsed.error, reference);
+  const reason = found ? found.reason : 'syntaxe incorrecte';
+  if (pos == null) return { ok: false, error: `JSON invalide : ${reason}.` };
+  pos = Math.min(pos, reference.length);
+  const { line, col } = lineCol(input, candidate.offset + pos);
+  return { ok: false, error: `JSON invalide (ligne ${line}, colonne ${col}) : ${reason}.` };
+}
+
+/**
+ * Parse every JSON block of a pasted text. → { ok: true, values, warnings } | { ok: false, error }
+ * Several fenced blocks (or JSON values written one after the other) are all kept; text after the
+ * end of a JSON value is ignored with a warning.
+ */
+function parseBlocks(input) {
+  const queue = extractCandidates(input);
+  const values = [];
+  const warnings = [];
+  for (let k = 0; k < queue.length; k++) {
+    const candidate = queue[k];
+    const res = parseCandidate(candidate, input);
+    if (!res.ok) {
+      const several = queue.length > 1 || values.length > 0;
+      return { ok: false, error: several ? `Bloc JSON n°${k + 1} : ${res.error}` : res.error };
+    }
+    values.push(res.value);
+    const rest = trimCandidate({ text: candidate.text.slice(res.end), offset: candidate.offset + res.end });
+    if (!rest.text) continue;
+    if (JSON_BLOCK_START.test(rest.text)) {
+      queue.splice(k + 1, 0, rest); // another JSON value right after this one
+    } else {
+      const maybeJson = /[{[]\s*["{[]/.test(rest.text);
+      warnings.push(
+        `Le texte après la fin du JSON a été ignoré (« ${excerpt(rest.text, 50)} »).${maybeJson ? ' S’il contient d’autres cartes, importe-le séparément.' : ''}`,
+      );
+    }
+  }
+  if (values.length > 1) warnings.unshift(`${values.length} blocs JSON trouvés : ils ont été importés ensemble.`);
+  return { ok: true, values, warnings };
 }
 
 /**
@@ -580,41 +670,29 @@ function looksLikeBackup(data) {
  *          | {ok: false, error: string}}
  */
 export function parseImport(text) {
-  let data;
+  let values;
+  let blockWarnings = [];
   if (text !== null && typeof text === 'object') {
-    data = text; // already parsed
+    values = [text]; // already parsed
   } else {
     const input = String(text ?? '').replace(/^\uFEFF/, '');
     if (!input.trim()) return { ok: false, error: 'Le texte est vide : colle ton JSON ou choisis un fichier .json.' };
-
-    const candidate = extractCandidate(input);
-    const attempts = [candidate.text, cleanJson(candidate.text)];
-    if (TYPO_QUOTES.test(candidate.text)) {
-      attempts.push(cleanJson(fixDelimiterQuotes(candidate.text)), cleanJson(fixAllQuotes(candidate.text)));
-    }
-    let parsed = null;
-    for (const attempt of attempts) {
-      parsed = tryParse(attempt);
-      if (parsed.ok) break;
-    }
-    if (!parsed.ok) {
-      // Report on the most "repaired" position-preserving variant, so tolerated issues are not reported.
-      const reference = attempts[attempts.length > 2 ? 2 : 1];
-      const found = findJsonError(reference);
-      let pos = found ? found.pos : enginePosition(parsed.error, reference);
-      const reason = found ? found.reason : 'syntaxe incorrecte';
-      if (pos == null) return { ok: false, error: `JSON invalide : ${reason}.` };
-      pos = Math.min(pos, reference.length);
-      const { line, col } = lineCol(input, candidate.offset + pos);
-      return { ok: false, error: `JSON invalide (ligne ${line}, colonne ${col}) : ${reason}.` };
-    }
-    data = parsed.value;
+    const blocks = parseBlocks(input);
+    if (!blocks.ok) return { ok: false, error: blocks.error };
+    values = blocks.values;
+    blockWarnings = blocks.warnings;
   }
 
-  if (looksLikeBackup(data)) return { ok: false, error: BACKUP_ERROR };
+  if (values.some(isBackupObject)) return { ok: false, error: BACKUP_ERROR };
 
   const parser = new Parser();
-  const tree = parser.root(data);
+  parser.warnings.push(...blockWarnings);
+  const tree = { folders: [], cards: [] };
+  for (const value of values) {
+    const part = parser.root(value);
+    tree.folders.push(...part.folders);
+    tree.cards.push(...part.cards);
+  }
   if (parser.stats.cards === 0 && parser.stats.folders === 0) return { ok: false, error: EMPTY_ERROR };
   return { ok: true, tree, warnings: parser.warnings, stats: { ...parser.stats } };
 }
@@ -633,11 +711,25 @@ function nextOrderAfter(items) {
   return max + 1;
 }
 
+/** Texts a card was imported with ({ front, back } strings), or null (card typed in the app). */
+function importedSource(card) {
+  const imp = card && card.imported;
+  if (!isPlainObject(imp) || typeof imp.front !== 'string' || typeof imp.back !== 'string') return null;
+  return imp;
+}
+
+/** One-line excerpt of a text for messages. */
+function excerpt(text, max = 60) {
+  const s = String(text ?? '').replace(/\s+/g, ' ').trim();
+  return s.length > max ? `${s.slice(0, max - 1).trimEnd()}…` : s;
+}
+
 /**
  * Compute what an import would change, without touching the database.
  * @param {{folders: Array, cards: Array}} tree  from parseImport
  * @param {{targetFolderId?: string|null, folders: Array, cards: Array}} ctx  current DB content
- * @returns Plan (see spec §6.3)
+ * @returns Plan (see spec §6.3), plus `keptCards` (matched cards whose verso was corrected in the
+ *          app: never overwritten) and `warnings` (string[], conflicts worth showing).
  */
 export function planImport(tree, { targetFolderId = null, folders = [], cards = [] } = {}) {
   const target = targetFolderId ?? null;
@@ -663,6 +755,9 @@ export function planImport(tree, { targetFolderId = null, folders = [], cards = 
     newFolders: [],
     newCards: [],
     updatedCards: [],
+    // Matched cards whose verso was changed in the app: never overwritten by an import.
+    keptCards: [], // [{ id, front, back /* verso proposed by the file */, conflict /* the file brings a new verso */ }]
+    warnings: [],
     summary: { foldersNew: 0, foldersReused: 0, cardsNew: 0, cardsUpdated: 0, cardsUnchanged: 0 },
   };
   const tempIds = new Set();
@@ -692,20 +787,36 @@ export function planImport(tree, { targetFolderId = null, folders = [], cards = 
     return slot;
   };
 
-  // Per folder ref: existing cards indexed by normalised recto (each matched at most once), next free order.
+  // Per folder ref: existing cards indexed by normalised recto — the current one and the one they were
+  // imported with (card.imported, see db.applyImportPlan), so that a recto corrected in the app is
+  // still recognised. Each existing card is matched at most once (shared entry). Next free order.
   const cardSlots = new Map();
   const cardSlot = (folderRef) => {
     let slot = cardSlots.get(folderRef);
     if (!slot) {
       const existing = tempIds.has(folderRef) ? [] : (cardsOf.get(folderRef) || []).slice().sort(byOrder);
       const byFront = new Map();
+      const byImported = new Map();
+      const index = (map, key, entry) => {
+        if (!key) return; // media-only recto: cannot be matched by text
+        if (!map.has(key)) map.set(key, []);
+        map.get(key).push(entry);
+      };
       for (const c of existing) {
-        const front = normalizeText(c.front?.text);
-        if (!front) continue; // media-only recto: cannot be matched by text
-        if (!byFront.has(front)) byFront.set(front, []);
-        byFront.get(front).push({ card: c, back: normalizeText(c.back?.text), used: false });
+        const imp = importedSource(c);
+        const entry = {
+          card: c,
+          back: normalizeText(c.back?.text),
+          impBack: imp ? normalizeText(imp.back) : null,
+          // Verso changed in the app since it was imported (exact text). Cards without an import
+          // source were typed in the app (or predate it): their verso always belongs to the user.
+          edited: !imp || String(c.back?.text ?? '').trim() !== imp.back.trim(),
+          used: false,
+        };
+        index(byFront, normalizeText(c.front?.text), entry);
+        if (imp) index(byImported, normalizeText(imp.front), entry);
       }
-      slot = { byFront, nextOrder: nextOrderAfter(existing) };
+      slot = { byFront, byImported, nextOrder: nextOrderAfter(existing) };
       cardSlots.set(folderRef, slot);
     }
     return slot;
@@ -714,28 +825,28 @@ export function planImport(tree, { targetFolderId = null, folders = [], cards = 
   const reused = new Set();
   const { summary } = plan;
 
-  const placeCards = (list, folderRef) => {
+  const placeCards = (list, folderRef, path) => {
     if (!list || !list.length) return;
     const slot = cardSlot(folderRef);
     const keys = list.map((c) => ({ front: normalizeText(c.front), back: normalizeText(c.back) }));
     const matches = new Array(list.length).fill(null);
-    // Pass 1: identical recto + verso (so that reordered duplicates stay stable).
-    keys.forEach((k, i) => {
-      const candidate = (slot.byFront.get(k.front) || []).find((e) => !e.used && e.back === k.back);
-      if (candidate) {
-        candidate.used = true;
-        matches[i] = candidate;
-      }
-    });
-    // Pass 2: same recto only.
-    keys.forEach((k, i) => {
-      if (matches[i]) return;
-      const candidate = (slot.byFront.get(k.front) || []).find((e) => !e.used);
-      if (candidate) {
-        candidate.used = true;
-        matches[i] = candidate;
-      }
-    });
+    const pass = (map, accept) => {
+      keys.forEach((k, i) => {
+        if (matches[i]) return;
+        const candidate = (map.get(k.front) || []).find((e) => !e.used && accept(e, k));
+        if (candidate) {
+          candidate.used = true;
+          matches[i] = candidate;
+        }
+      });
+    };
+    // 1. identical recto + verso (so that reordered duplicates stay stable);
+    // 2. the very recto + verso it was imported with (its texts were corrected in the app);
+    // 3. same recto; 4. same imported recto (recto corrected in the app: no duplicate).
+    pass(slot.byFront, (e, k) => e.back === k.back);
+    pass(slot.byImported, (e, k) => e.impBack === k.back);
+    pass(slot.byFront, () => true);
+    pass(slot.byImported, () => true);
     // Emit in JSON order.
     list.forEach((c, i) => {
       const match = matches[i];
@@ -744,14 +855,23 @@ export function planImport(tree, { targetFolderId = null, folders = [], cards = 
         summary.cardsNew++;
       } else if (match.back === keys[i].back) {
         summary.cardsUnchanged++;
-      } else {
+      } else if (!match.edited) {
         plan.updatedCards.push({ id: match.card.id, back: c.back });
         summary.cardsUpdated++;
+      } else {
+        // The user corrected this verso in the app: keep it. Only worth a warning when the file
+        // brings a verso different from the one originally imported.
+        const conflict = match.impBack !== keys[i].back;
+        const front = String(match.card.front?.text ?? '').trim() || c.front;
+        plan.keptCards.push({ id: match.card.id, front, back: c.back, conflict });
+        if (conflict) {
+          plan.warnings.push(`${formatPath(path, `« ${front} »`)} : verso modifié dans l’app, conservé (le fichier propose « ${excerpt(c.back)} »)`);
+        }
       }
     });
   };
 
-  const placeFolder = (folder, parentRef) => {
+  const placeFolder = (folder, parentRef, path) => {
     const slot = folderSlot(parentRef);
     const name = String(folder.name ?? '').trim() || DEFAULT_FOLDER_NAME;
     const key = normalizeText(name);
@@ -765,16 +885,16 @@ export function planImport(tree, { targetFolderId = null, folders = [], cards = 
       reused.add(ref);
       summary.foldersReused++;
     }
-    placeCards(folder.cards, ref);
-    for (const sub of folder.folders || []) placeFolder(sub, ref);
+    placeCards(folder.cards, ref, [...path, name]);
+    for (const sub of folder.folders || []) placeFolder(sub, ref, [...path, name]);
   };
 
-  for (const folder of tree?.folders || []) placeFolder(folder, target);
+  for (const folder of tree?.folders || []) placeFolder(folder, target, []);
 
   const rootCards = tree?.cards || [];
   if (rootCards.length) {
-    if (target === null) placeFolder({ name: ROOT_IMPORT_FOLDER, folders: [], cards: rootCards }, null);
-    else placeCards(rootCards, target);
+    if (target === null) placeFolder({ name: ROOT_IMPORT_FOLDER, folders: [], cards: rootCards }, null, []);
+    else placeCards(rootCards, target, [folderById.get(target).name]);
   }
 
   return plan;

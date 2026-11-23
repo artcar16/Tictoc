@@ -85,8 +85,10 @@ pour une IA »** (à coller dans ChatGPT, Claude… avec ton cours pour qu'il g�
 un aperçu, puis sur « Importer ». Tu peux réimporter le même fichier enrichi (par exemple avec le chapitre 4 en plus) :
 
 - un dossier de même nom au même endroit est réutilisé (pas de doublon) ;
-- une carte de même recto dans le même dossier est reconnue : si son verso a changé, il est mis à jour (photos et
-  audios conservés), sinon elle reste telle quelle ;
+- une carte de même recto dans le même dossier est reconnue (même si tu as corrigé son recto dans l'app) : si son
+  verso a changé dans le fichier, il est mis à jour (photos et audios conservés), sinon elle reste telle quelle ;
+- un verso que tu as corrigé dans l'app n'est jamais remplacé par celui du fichier : l'aperçu liste les versos qui
+  seront remplacés et signale les cartes corrigées qui sont conservées ;
 - les nouveautés sont ajoutées à la suite, rien n'est supprimé et ta progression est conservée.
 
 Des cartes placées directement à la racine du JSON, importées sans dossier de destination, sont rangées dans un
@@ -151,4 +153,5 @@ adresse IP, le navigateur désactive le mode hors ligne et le micro (ils exigent
 essai sur téléphone, passe par GitHub Pages.
 
 Le dossier `app/` est exactement ce qui est publié. Si tu y ajoutes un fichier, ajoute-le aussi à la liste `ASSETS`
-de `app/sw.js` (le service worker le met en cache pour le hors-ligne) ; `npm test` le vérifie.
+de `app/sw.js` (le service worker le met en cache pour le hors-ligne), et un nouveau module JS aussi à la liste
+`<link rel="modulepreload">` de `app/index.html` (tous les modules sont chargés en parallèle) ; `npm test` le vérifie.

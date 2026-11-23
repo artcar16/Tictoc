@@ -3,7 +3,7 @@
 
 import * as db from '../db.js';
 import * as media from '../media.js';
-import { h } from '../dom.js';
+import { h, frSpaces } from '../dom.js';
 import { icon } from './icons.js';
 
 /** CSS size modifier from the text length (long texts get smaller type). */
@@ -25,7 +25,8 @@ export function mountFace(face, { className = '' } = {}) {
   let destroyed = false;
 
   const text = (f.text || '').trim();
-  if (text) el.append(h('div', { class: ['face-text', textSizeClass(text)] }, text));
+  // Display only (the stored text is unchanged): « ; », « : », « ? » never start a line on their own.
+  if (text) el.append(h('div', { class: ['face-text', textSizeClass(text)] }, frSpaces(text)));
 
   if (f.imageId) {
     const img = h('img', { class: 'face-img', alt: text ? `Image : ${text.slice(0, 60)}` : 'Image de la carte', decoding: 'async' });

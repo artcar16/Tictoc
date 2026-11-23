@@ -43,13 +43,24 @@ function applyPlan(plan, state) {
       order: c.order,
       createdAt: 0,
       updatedAt: 0,
+      imported: { front: c.front, back: c.back },
     });
   }
   for (const u of plan.updatedCards) {
     const card = state.cards.find((c) => c.id === u.id);
     card.back = { ...card.back, text: u.back };
+    card.imported = { front: card.imported.front, back: u.back };
   }
   return state;
+}
+
+/** What the card editor does (db.updateCard): changes the texts, keeps every other field. */
+function editInApp(state, front, patch) {
+  const card = state.cards.find((c) => c.front.text === front);
+  assert.ok(card, `card « ${front} »`);
+  if ('front' in patch) card.front = { ...card.front, text: patch.front };
+  if ('back' in patch) card.back = { ...card.back, text: patch.back };
+  return card;
 }
 
 function importInto(state, json, targetFolderId = null) {
@@ -402,6 +413,71 @@ describe('parseImport — fences and repairs', () => {
     const r = ok('[{"recto": "Citation", "verso": "Il a dit “bonjour”, puis est parti"}]');
     assert.equal(r.tree.cards[0].back, 'Il a dit “bonjour”, puis est parti');
   });
+
+  test('raw JSON followed by a closing sentence: the sentence is ignored with a warning', () => {
+    for (const closing of ['J’espère que ces fiches t’aideront !', 'Souhaites-tu que je continue avec le chapitre 5 ?', 'Dis-moi si tu veux la suite (chapitre 5).']) {
+      const r = ok(`${JSON.stringify(COURSE, null, 2)}\n\n${closing}`);
+      assert.equal(r.stats.cards, 3, closing);
+      assert.equal(r.warnings.length, 1);
+      assert.match(r.warnings[0], /^Le texte après la fin du JSON a été ignoré \(« /);
+      assert.ok(r.warnings[0].includes(closing.slice(0, 20)));
+    }
+  });
+
+  test('trailing text with commas, comments or typographic quotes in the JSON is still recovered', () => {
+    const r = ok('{“cartes”: [{“recto”: “a”, “verso”: “b”},]} // fin\nBonne révision !');
+    assert.deepEqual(r.tree.cards, [{ front: 'a', back: 'b' }]);
+    assert.equal(r.warnings.length, 1);
+  });
+
+  test('an extra closing bracket is still an error, not ignored text', () => {
+    assert.match(fail('{"dossiers": [{"nom": "A", "cartes": []}]}}'), /contenu en trop/);
+    assert.match(fail('[{"recto": "a", "verso": "b"}], {"recto": "c", "verso": "d"}]'), /contenu en trop/);
+  });
+
+  test('several fenced blocks are all imported together', () => {
+    const text = [
+      'Voici le chapitre 1 :',
+      '```json',
+      '{"dossiers": [{"nom": "Chapitre 1", "cartes": [{"recto": "a", "verso": "b"}]}]}',
+      '```',
+      'Et le chapitre 2 :',
+      '```json',
+      '{"dossiers": [{"nom": "Chapitre 2", "cartes": [{"recto": "c", "verso": "d"}, {"recto": "e", "verso": "f"}]}]}',
+      '```',
+      'Bonne révision !',
+    ].join('\n');
+    const r = ok(text);
+    assert.deepEqual(r.tree.folders.map((f) => f.name), ['Chapitre 1', 'Chapitre 2']);
+    assert.deepEqual(r.stats, { folders: 2, cards: 3 });
+    assert.equal(r.warnings[0], '2 blocs JSON trouvés : ils ont été importés ensemble.');
+    // Same parent folder in both blocks: merged by the import plan.
+    const two = ok('```json\n{"nom": "Compta", "dossiers": [{"nom": "Ch1", "cartes": [["a", "b"]]}]}\n```\n```json\n{"nom": "Compta", "dossiers": [{"nom": "Ch2", "cartes": [["c", "d"]]}]}\n```');
+    const plan = planImport(two.tree, { targetFolderId: null, folders: [], cards: [] });
+    assert.deepEqual(plan.newFolders.map((f) => f.name), ['Compta', 'Ch1', 'Ch2']);
+    assert.equal(plan.summary.cardsNew, 2);
+  });
+
+  test('a non-JSON fence next to a JSON fence is ignored', () => {
+    const r = ok('```text\nmon cours\n```\n```json\n[{"recto": "a", "verso": "b"}]\n```');
+    assert.deepEqual(r.tree.cards, [{ front: 'a', back: 'b' }]);
+    assert.deepEqual(r.warnings, []);
+  });
+
+  test('an invalid block among several is reported with its number and position', () => {
+    const text = '```json\n[{"recto": "a", "verso": "b"}]\n```\n```json\n[{"recto": "c" "verso": "d"}]\n```';
+    assert.match(fail(text), /^Bloc JSON n°2 : JSON invalide \(ligne 5, colonne 16\)/);
+  });
+
+  test('JSON values written one after the other are all imported', () => {
+    const r = ok('{"nom": "A", "cartes": [["a", "b"]]}\n\n{"nom": "B", "cartes": [["c", "d"]]}');
+    assert.deepEqual(r.tree.folders.map((f) => f.name), ['A', 'B']);
+    assert.match(r.warnings[0], /^2 blocs JSON/);
+  });
+
+  test('a backup in any block is refused', () => {
+    assert.match(fail('```json\n[["a", "b"]]\n```\n```json\n{"app": "recto", "kind": "backup", "media": []}\n```'), /sauvegarde complète/);
+  });
 });
 
 /* ------------------------------------------------------------------------ */
@@ -647,6 +723,102 @@ describe('planImport', () => {
     assert.deepEqual(plan.summary, { foldersNew: 0, foldersReused: 3, cardsNew: 0, cardsUpdated: 1, cardsUnchanged: 2 });
     assert.deepEqual(plan.updatedCards, [{ id: actif.id, back: 'Ressources contrôlées par l’entreprise' }]);
     assert.equal(state.cards.length, 3);
+  });
+
+  test('a verso corrected in the app is kept when the same file is re-imported (no warning)', () => {
+    const state = { folders: [], cards: [] };
+    importInto(state, COURSE);
+    const bilan = editInApp(state, 'Bilan', { back: 'Photographie du patrimoine à une date donnée (corrigé)' });
+    const enriched = clone(COURSE);
+    enriched.dossiers[0].dossiers.push({ nom: 'Chapitre 3', cartes: [{ recto: 'BFR', verso: 'Besoin en fonds de roulement' }] });
+    const plan = importInto(state, enriched);
+    assert.deepEqual(plan.updatedCards, []);
+    assert.deepEqual(plan.summary, { foldersNew: 1, foldersReused: 3, cardsNew: 1, cardsUpdated: 0, cardsUnchanged: 2 });
+    assert.deepEqual(plan.keptCards, [{ id: bilan.id, front: 'Bilan', back: 'Photographie du patrimoine', conflict: false }]);
+    assert.deepEqual(plan.warnings, []);
+    assert.equal(bilan.back.text, 'Photographie du patrimoine à une date donnée (corrigé)');
+  });
+
+  test('a verso corrected in the app is kept even when the file changes it too (with a warning)', () => {
+    const state = { folders: [], cards: [] };
+    importInto(state, COURSE);
+    const actif = editInApp(state, 'Actif', { back: 'Ma définition' });
+    const changed = clone(COURSE);
+    changed.dossiers[0].dossiers[0].cartes[1].verso = 'Ressources contrôlées';
+    const plan = importInto(state, changed);
+    assert.deepEqual(plan.updatedCards, []);
+    assert.equal(plan.summary.cardsUpdated, 0);
+    assert.deepEqual(plan.keptCards, [{ id: actif.id, front: 'Actif', back: 'Ressources contrôlées', conflict: true }]);
+    assert.equal(plan.warnings.length, 1);
+    assert.match(plan.warnings[0], /^Comptabilité › Chapitre 1 › « Actif » : verso modifié dans l’app, conservé/);
+    assert.match(plan.warnings[0], /Ressources contrôlées/);
+    assert.equal(actif.back.text, 'Ma définition');
+  });
+
+  test('an unedited imported card is still updated, and then updated again', () => {
+    const state = { folders: [], cards: [] };
+    importInto(state, COURSE);
+    const v2 = clone(COURSE);
+    v2.dossiers[0].dossiers[0].cartes[0].verso = 'Version 2';
+    const bilan = state.cards.find((c) => c.front.text === 'Bilan');
+    let plan = importInto(state, v2);
+    assert.deepEqual(plan.updatedCards, [{ id: bilan.id, back: 'Version 2' }]);
+    assert.deepEqual(plan.keptCards, []);
+    v2.dossiers[0].dossiers[0].cartes[0].verso = 'Version 3';
+    plan = importInto(state, v2);
+    assert.deepEqual(plan.updatedCards, [{ id: bilan.id, back: 'Version 3' }]);
+    assert.equal(bilan.back.text, 'Version 3');
+  });
+
+  test('a recto corrected in the app still matches (no duplicate card)', () => {
+    const state = { folders: [], cards: [] };
+    importInto(state, COURSE);
+    const actif = editInApp(state, 'Actif', { front: 'Actif (biens + droits)' });
+    const enriched = clone(COURSE);
+    enriched.dossiers[0].dossiers[0].cartes.push({ recto: 'Passif', verso: 'Dettes + capitaux propres' });
+    const plan = importInto(state, enriched);
+    assert.deepEqual(plan.newCards.map((c) => c.front), ['Passif']);
+    assert.deepEqual(plan.summary, { foldersNew: 0, foldersReused: 3, cardsNew: 1, cardsUpdated: 0, cardsUnchanged: 3 });
+    assert.equal(state.cards.filter((c) => /^Actif/.test(c.front.text)).length, 1);
+
+    // The file then changes that verso: the card (recto edited, verso untouched) is updated.
+    enriched.dossiers[0].dossiers[0].cartes[1].verso = 'Ressources contrôlées';
+    const again = importInto(state, enriched);
+    assert.deepEqual(again.updatedCards, [{ id: actif.id, back: 'Ressources contrôlées' }]);
+    assert.equal(again.summary.cardsNew, 0);
+  });
+
+  test('recto and verso both corrected in the app: matched, nothing overwritten', () => {
+    const state = { folders: [], cards: [] };
+    importInto(state, COURSE);
+    const bilan = editInApp(state, 'Bilan', { front: 'Le bilan', back: 'Photo du patrimoine' });
+    const plan = importInto(state, COURSE);
+    assert.deepEqual(plan.newCards, []);
+    assert.deepEqual(plan.updatedCards, []);
+    assert.deepEqual(plan.keptCards.map((k) => [k.id, k.front, k.conflict]), [[bilan.id, 'Le bilan', false]]);
+  });
+
+  test('a card created in the app (no import source) is never overwritten', () => {
+    const folders = [{ id: 'T', parentId: null, name: 'Cible', order: 0, createdAt: 0 }];
+    const cards = [{ id: 'k', folderId: 'T', front: { text: 'Bilan' }, back: { text: 'Écrit à la main' }, order: 0, createdAt: 0 }];
+    const plan = planImport(ok('{"nom": "Cible", "cartes": [{"recto": "Bilan", "verso": "Autre"}]}').tree, { targetFolderId: null, folders, cards });
+    assert.deepEqual(plan.updatedCards, []);
+    assert.deepEqual(plan.newCards, []);
+    assert.deepEqual(plan.keptCards, [{ id: 'k', front: 'Bilan', back: 'Autre', conflict: true }]);
+    assert.match(plan.warnings[0], /^Cible › « Bilan » : verso modifié dans l’app, conservé/);
+  });
+
+  test('the original import pairing wins over a recto-only match', () => {
+    // Two cards imported with the same recto; the user corrected the verso of the second one.
+    const state = { folders: [], cards: [] };
+    const json = { nom: 'Dup', cartes: [{ recto: 'Bilan', verso: 'définition' }, { recto: 'Bilan', verso: 'formule' }] };
+    importInto(state, json);
+    state.cards[1].back.text = 'formule corrigée';
+    const plan = importInto(state, { nom: 'Dup', cartes: [json.cartes[1], json.cartes[0]] });
+    assert.deepEqual(plan.newCards, []);
+    assert.deepEqual(plan.updatedCards, []);
+    assert.deepEqual(plan.keptCards.map((k) => [k.id, k.conflict]), [[state.cards[1].id, false]]);
+    assert.equal(plan.summary.cardsUnchanged, 1);
   });
 
   test('verso differing only by case/spaces is unchanged', () => {

@@ -15,7 +15,9 @@ import { navigate, back, replaceHashQuietly } from './router.js';
 import { nextReviewText, countNew } from './stats.js';
 
 const SWIPE_RATIO = 0.3; // fraction of the card width that commits a swipe
-const DOUBLE_TAP_MS = 300; // a tap this soon after an answer is a double tap, not « show the answer »
+// A tap this soon after the previous one (answer, « Afficher la réponse », restart) is the second
+// half of a double tap: it must not answer a card that was never read, nor skip the end screen.
+const DOUBLE_TAP_MS = 300;
 
 function enc(id) {
   return encodeURIComponent(id);
@@ -85,7 +87,7 @@ export async function renderStudy(root, ctx, mode) {
     dirs: new Map(), // cardId → 'front'|'back' (mixed direction is fixed for the session)
     views: [], // mounted faces to destroy
     busy: false, // a swipe animation is running
-    answeredAt: 0, // performance.now() of the last answer (double-tap protection)
+    tapAt: 0, // performance.now() of the last user reveal, answer or restart (double-tap protection)
   };
 
   /* ---------------------------------------------------------------- */
@@ -219,19 +221,17 @@ export async function renderStudy(root, ctx, mode) {
       { class: 'swipe-hint is-yes', 'aria-hidden': 'true' },
       h('span', { class: 'swipe-label' }, 'Je sais', icon('check', { size: 16, strokeWidth: 2.6 })),
     );
+    // The answer appended by reveal() is read out by screen readers.
     innerEl = h(
       'div',
-      { class: 'fc-inner' },
+      { class: 'fc-inner', 'aria-live': 'polite' },
       h('section', { class: 'fc-q' }, h('div', { class: 'fc-side' }, dir === 'back' ? 'Verso' : 'Recto'), qView.el),
     );
+    // Tap anywhere on the card to show the answer. Not a role=button: its question and answer
+    // must stay readable by screen readers (« Afficher la réponse » is the accessible control).
     cardEl = h(
       'div',
-      {
-        class: ['flashcard', animate && !prefersReducedMotion() && 'is-entering'],
-        role: 'button',
-        tabindex: '0',
-        'aria-label': 'Carte : touche pour la retourner',
-      },
+      { class: ['flashcard', animate && !prefersReducedMotion() && 'is-entering'] },
       h('div', { class: 'flashcard-scroll' }, innerEl),
       hintNo,
       hintYes,
@@ -246,15 +246,18 @@ export async function renderStudy(root, ctx, mode) {
     else renderActions();
   }
 
-  /** A pointer tap right after an answer lands on the next card's button: ignore it. */
+  /** The second tap of a double tap lands on the button that just replaced the first one: ignore it
+   *  (pointer clicks only; keyboard activations have detail 0). */
   function isDoubleTap(e) {
-    return !!(e && e.detail) && performance.now() - S.answeredAt < DOUBLE_TAP_MS;
+    return !!(e && e.detail) && performance.now() - S.tapAt < DOUBLE_TAP_MS;
   }
 
   function reveal({ force = false, animate = true } = {}) {
     const s = S.session;
     if (!s || s.done || (S.revealed && !force)) return;
     S.revealed = true;
+    // Not on the re-reveal after undo / edit: that tap happened elsewhere on the screen.
+    if (!force) S.tapAt = performance.now();
     const card = cardById.get(s.current);
     const dir = directionFor(card.id);
     const aFace = dir === 'back' ? card.front : card.back;
@@ -265,7 +268,6 @@ export async function renderStudy(root, ctx, mode) {
       h('section', { class: ['fc-a', animate && !prefersReducedMotion() && 'is-appearing'] }, h('div', { class: 'fc-side' }, dir === 'back' ? 'Recto' : 'Verso'), aView.el),
     );
     cardEl.classList.add('is-revealed');
-    cardEl.setAttribute('aria-label', 'Carte retournée : glisse à droite si tu sais, à gauche sinon');
     renderActions();
   }
 
@@ -292,13 +294,13 @@ export async function renderStudy(root, ctx, mode) {
         { class: 'answer-row' },
         h(
           'button',
-          { type: 'button', class: 'btn btn-answer is-no', onClick: () => doAnswer(false) },
+          { type: 'button', class: 'btn btn-answer is-no', onClick: (e) => !isDoubleTap(e) && doAnswer(false) },
           icon('close', { size: 20, strokeWidth: 2.2 }),
           'Je ne sais pas',
         ),
         h(
           'button',
-          { type: 'button', class: 'btn btn-answer is-yes', onClick: () => doAnswer(true) },
+          { type: 'button', class: 'btn btn-answer is-yes', onClick: (e) => !isDoubleTap(e) && doAnswer(true) },
           icon('check', { size: 20, strokeWidth: 2.2 }),
           'Je sais',
         ),
@@ -344,7 +346,7 @@ export async function renderStudy(root, ctx, mode) {
 
     S.undo.push(entry);
     s.answer(known);
-    S.answeredAt = performance.now();
+    S.tapAt = performance.now();
     S.revealed = false;
     renderCurrent();
   }
@@ -392,6 +394,10 @@ export async function renderStudy(root, ctx, mode) {
     if (!ctx.alive()) return;
     if (!fresh) {
       cardById.delete(cardId);
+      // Also out of the end screen's counts and of « +N nouvelles cartes » (db.deleteCard removed
+      // its progress).
+      methodCards = methodCards.filter((c) => c.id !== cardId);
+      progressByCard.delete(cardId);
       s.remove(cardId);
       S.undo = []; // the undo history may reference the deleted card
       S.revealed = false;
@@ -507,6 +513,12 @@ export async function renderStudy(root, ctx, mode) {
 
     const buttons = [];
     const body = h('div', { class: 'end' });
+    /** End-screen button starting another session (the second tap of a double tap is ignored). */
+    const restart = (makeQueue) => (e) => {
+      if (isDoubleTap(e)) return;
+      S.tapAt = performance.now(); // a further tap must not reveal the new session's first card
+      start(makeQueue());
+    };
 
     if (empty && !methodCards.length) {
       body.append(
@@ -523,7 +535,10 @@ export async function renderStudy(root, ctx, mode) {
         buttons.push(h('a', { class: 'btn btn-primary btn-block btn-lg', href: `#/method/${enc(id)}/select` }, 'Choisir les cartes'));
       }
     } else {
-      const titleText = empty && scheduled ? "Rien à réviser pour aujourd'hui" : 'Session terminée';
+      // Cards due now that this session's queue did not hold: the study day changed during the
+      // session (past 4 am, or the screen was left open overnight). Normally empty.
+      const pendingNow = scheduled ? scheduledQueue().filter((cid) => cardById.has(cid)) : [];
+      const titleText = empty && scheduled && !pendingNow.length ? "Rien à réviser pour aujourd'hui" : 'Session terminée';
       body.append(
         h('div', { class: 'end-icon' }, icon('check', { size: 30, strokeWidth: 2.4 })),
         h('h2', { class: 'end-title' }, `${titleText} `, h('span', { class: 'end-check' }, '✓')),
@@ -534,11 +549,13 @@ export async function renderStudy(root, ctx, mode) {
             'div',
             { class: 'end-stats' },
             h('div', { class: 'stat' }, h('div', { class: 'stat-value' }, String(stats.distinct)), h('div', { class: 'stat-label' }, stats.distinct > 1 ? 'cartes révisées' : 'carte révisée')),
-            h('div', { class: 'stat' }, h('div', { class: 'stat-value' }, String(firstKnown)), h('div', { class: 'stat-label' }, '« je sais » du premier coup')),
+            h('div', { class: 'stat' }, h('div', { class: 'stat-value' }, String(firstKnown)), h('div', { class: 'stat-label' }, '«\u00A0je sais\u00A0» du premier coup')),
           ),
         );
       }
-      if (scheduled) {
+      if (scheduled && pendingNow.length) {
+        body.append(h('p', { class: 'end-next' }, icon('calendar', { size: 18 }), `Encore ${plural(pendingNow.length, 'carte')} à réviser aujourd'hui`));
+      } else if (scheduled) {
         const next = nextReviewText(method, methodCards, progressByCard, studyDay());
         if (next) body.append(h('p', { class: 'end-next' }, icon('calendar', { size: 18 }), next));
       } else {
@@ -546,6 +563,16 @@ export async function renderStudy(root, ctx, mode) {
       }
 
       if (scheduled) {
+        if (pendingNow.length) {
+          buttons.push(
+            h(
+              'button',
+              { type: 'button', class: 'btn btn-primary btn-block btn-lg', onClick: restart(() => scheduledQueue()) },
+              icon('review', { size: 20 }),
+              `Continuer (${pendingNow.length})`,
+            ),
+          );
+        }
         const newLeft = countNew(methodCards, progressByCard);
         if (newLeft > 0) {
           const n = Math.min(10, newLeft);
@@ -554,8 +581,8 @@ export async function renderStudy(root, ctx, mode) {
               'button',
               {
                 type: 'button',
-                class: 'btn btn-primary btn-block btn-lg',
-                onClick: () => start(scheduledQueue(10, true)),
+                class: pendingNow.length ? 'btn btn-secondary btn-block' : 'btn btn-primary btn-block btn-lg',
+                onClick: restart(() => scheduledQueue(10, true)),
               },
               icon('plus', { size: 20 }),
               `+${n} ${n > 1 ? 'nouvelles cartes' : 'nouvelle carte'}`,
@@ -569,7 +596,7 @@ export async function renderStudy(root, ctx, mode) {
               {
                 type: 'button',
                 class: 'btn btn-secondary btn-block',
-                onClick: () => leave(`#/practice/method/${enc(id)}`),
+                onClick: (e) => !isDoubleTap(e) && leave(`#/practice/method/${enc(id)}`),
               },
               icon('shuffle', { size: 20 }),
               'Entraînement libre',
@@ -580,14 +607,14 @@ export async function renderStudy(root, ctx, mode) {
         buttons.push(
           h(
             'button',
-            { type: 'button', class: 'btn btn-primary btn-block btn-lg', onClick: () => start(practiceQueue()) },
+            { type: 'button', class: 'btn btn-primary btn-block btn-lg', onClick: restart(practiceQueue) },
             icon('reset', { size: 20 }),
             'Recommencer',
           ),
         );
       }
     }
-    buttons.push(h('button', { type: 'button', class: 'btn btn-ghost btn-block', onClick: () => leave() }, 'Retour'));
+    buttons.push(h('button', { type: 'button', class: 'btn btn-ghost btn-block', onClick: (e) => !isDoubleTap(e) && leave() }, 'Retour'));
 
     stage.replaceChildren(body);
     actions.replaceChildren(h('div', { class: 'end-actions' }, buttons));

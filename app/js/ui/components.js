@@ -1,7 +1,8 @@
 // Reusable UI components: toasts, dialogs, action sheets, folder picker, headers,
 // empty states, plus small helpers for async handlers.
 
-import { h, nextFrame, prefersReducedMotion } from '../dom.js';
+import { h, nextFrame, prefersReducedMotion, frSpaces } from '../dom.js';
+import { watchClose } from '../back.js';
 import { icon } from './icons.js';
 
 /* ------------------------------------------------------------------ */
@@ -18,7 +19,7 @@ export function toast(message, { duration = 2600 } = {}) {
     document.body.appendChild(toastRoot);
   }
   clearTimeout(toastTimer);
-  const el = h('div', { class: 'toast' }, String(message));
+  const el = h('div', { class: 'toast' }, frSpaces(message));
   toastRoot.replaceChildren(el);
   requestAnimationFrame(() => el.classList.add('is-visible'));
   toastTimer = setTimeout(() => {
@@ -31,6 +32,16 @@ export function toast(message, { duration = 2600 } = {}) {
 export function errorMessage(err) {
   if (!err) return 'inconnue';
   if (typeof err === 'string') return err;
+  if (typeof err === 'object') {
+    // Storage full: browsers report it with a technical English name (and often no message).
+    if (err.name === 'QuotaExceededError' || err.name === 'NS_ERROR_DOM_QUOTA_REACHED' || err.code === 22) {
+      return 'plus assez d’espace de stockage sur ce téléphone. Libère de la place (photos, vidéos, applis) puis réessaie ; les données déjà enregistrées ne sont pas touchées';
+    }
+    // Safari: lost connection to its storage process, or a full disk.
+    if (err.name === 'UnknownError') {
+      return 'le stockage du navigateur a rencontré une erreur. Ferme et rouvre l’application puis réessaie ; si cela continue, le téléphone manque peut-être d’espace';
+    }
+  }
   return err.message || err.name || String(err);
 }
 
@@ -96,15 +107,35 @@ export function isOverlayOpen() {
   return layers.length > 0;
 }
 
-/** Register an overlay. `onEscape` is called when Escape is pressed while it is on top. */
+/**
+ * Register an overlay. `onEscape` is called when Escape is pressed while it is on top, and for the
+ * Android back button / gesture (see back.js). `keepOnNavigate`: survives a route change (the card
+ * editor keeps its unsaved card; dialogs and sheets belong to the screen that opened them).
+ */
 export function pushLayer(layer) {
   layer.restoreFocus = document.activeElement;
   layers.push(layer);
   document.documentElement.classList.add('has-overlay');
+  watchBack(layer);
   return layer;
 }
 
+/** Close the layer on Android back; watch again if it refused to close (« Continuer »). */
+function watchBack(layer) {
+  layer.unwatch = watchClose(async () => {
+    layer.unwatch = null;
+    try {
+      await layer.onEscape?.();
+    } catch (err) {
+      showError(err);
+    }
+    if (layers.includes(layer) && !layer.unwatch) watchBack(layer);
+  });
+}
+
 export function popLayer(layer) {
+  layer.unwatch?.();
+  layer.unwatch = null;
   const i = layers.indexOf(layer);
   if (i >= 0) layers.splice(i, 1);
   if (!layers.length) document.documentElement.classList.remove('has-overlay');
@@ -114,6 +145,21 @@ export function popLayer(layer) {
       f.focus({ preventScroll: true });
     } catch {
       /* ignore */
+    }
+  }
+}
+
+/**
+ * Cancel the open dialogs and sheets (the card editor stays): called when the screen changes under
+ * them (back without CloseWatcher support), so their actions never run against a screen that is gone.
+ */
+export function closeTransientLayers() {
+  for (const layer of [...layers].reverse()) {
+    if (layer.keepOnNavigate || !layers.includes(layer)) continue;
+    try {
+      layer.onEscape?.();
+    } catch (err) {
+      console.warn('[recto] close layer', err);
     }
   }
 }
@@ -157,7 +203,7 @@ function baseDialog({ title, describedBy, className = '' }) {
     'aria-labelledby': title ? titleId : null,
     'aria-describedby': describedBy || null,
   });
-  if (title) box.append(h('h2', { class: 'dialog-title', id: titleId }, title));
+  if (title) box.append(h('h2', { class: 'dialog-title', id: titleId }, frSpaces(title)));
   const backdrop = h('div', { class: 'dialog-backdrop' }, box);
   return { backdrop, box };
 }
@@ -188,7 +234,7 @@ export function confirmDialog({
       { type: 'button', class: ['btn', danger ? 'btn-danger' : 'btn-primary'], onClick: () => close(true) },
       confirmLabel,
     );
-    if (message) box.append(h('p', { class: 'dialog-message', id: msgId }, message));
+    if (message) box.append(h('p', { class: 'dialog-message', id: msgId }, frSpaces(message)));
     box.append(h('div', { class: 'dialog-actions' }, cancelBtn, okBtn));
     backdrop.addEventListener('click', (e) => {
       if (e.target === backdrop) close(false);
@@ -249,7 +295,7 @@ export function promptDialog({
           if (v) close(v);
         },
       },
-      label ? h('label', { class: 'field-label', htmlFor: inputId }, label) : null,
+      label ? h('label', { class: 'field-label', htmlFor: inputId }, frSpaces(label)) : null,
       input,
       h(
         'div',
@@ -277,7 +323,7 @@ export function promptDialog({
 function baseSheet({ title, className = '' }) {
   const sheet = h('div', { class: ['sheet', className], role: 'dialog', 'aria-modal': 'true', 'aria-label': title || 'Menu' });
   const backdrop = h('div', { class: 'sheet-backdrop' }, sheet);
-  if (title) sheet.append(h('div', { class: 'sheet-title' }, title));
+  if (title) sheet.append(h('div', { class: 'sheet-title' }, frSpaces(title)));
   return { backdrop, sheet };
 }
 
@@ -463,8 +509,8 @@ export function emptyState({ iconName = 'info', title, text = '', actions = [] }
     'div',
     { class: 'empty' },
     h('div', { class: 'empty-icon' }, icon(iconName, { size: 26 })),
-    h('h2', { class: 'empty-title' }, title),
-    text ? h('p', { class: 'empty-text' }, text) : null,
+    h('h2', { class: 'empty-title' }, frSpaces(title)),
+    text ? h('p', { class: 'empty-text' }, frSpaces(text)) : null,
     actions.length ? h('div', { class: 'empty-actions' }, actions) : null,
   );
 }
@@ -482,6 +528,42 @@ export function errorBlock(err, onRetry) {
     text: errorMessage(err),
     actions: onRetry ? [h('button', { type: 'button', class: 'btn btn-secondary', onClick: onRetry }, 'Réessayer')] : [],
   });
+}
+
+/* ------------------------------------------------------------------ */
+/* iPhone: Safari tab vs app added to the Home Screen                  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * True in an iPhone / iPad browser tab, false in the app added to the Home Screen and on other
+ * systems (navigator.standalone only exists in iOS WebKit). The two have separate storage, and
+ * Safari erases a site's data after 7 days of use without a visit (Home Screen apps are exempt).
+ */
+export function isIOSBrowserTab() {
+  return typeof navigator !== 'undefined' && navigator.standalone === false;
+}
+
+/** Calm notice asking to install the app before relying on it (see isIOSBrowserTab). */
+export function iosTabNotice({ hasCards = false, onDismiss = null } = {}) {
+  const text =
+    "Sur iPhone, ajoute Recto à l'écran d'accueil (Partager → Sur l'écran d'accueil) et utilise toujours l'app installée : " +
+    "dans Safari, les données peuvent être effacées après 7 jours sans visite, et l'app installée a ses propres données." +
+    (hasCards ? " Exporte d'abord une sauvegarde ici (onglet Données), puis restaure-la dans l'app installée." : '');
+  const el = h('div', { class: 'notice is-info ios-notice', role: 'note' }, icon('info', { size: 18 }), h('p', { class: 'notice-text' }, frSpaces(text)));
+  if (onDismiss) {
+    el.append(
+      iconButton(
+        'close',
+        'Masquer ce message',
+        () => {
+          el.remove();
+          onDismiss();
+        },
+        { className: 'notice-close', size: 18 },
+      ),
+    );
+  }
+  return el;
 }
 
 /* ------------------------------------------------------------------ */

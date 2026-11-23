@@ -568,7 +568,7 @@ html.media-lock body {
   padding: 10px 14px;
   border-radius: var(--radius-sm, 10px);
   background: var(--danger-soft, rgba(217, 72, 15, 0.1));
-  color: var(--danger, #d9480f);
+  color: var(--danger-text, #b83c0c);
   text-align: left;
 }
 

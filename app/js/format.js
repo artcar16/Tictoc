@@ -30,7 +30,7 @@ export const FORMAT_HELP = [
   'Chaque dossier a un « nom » et peut contenir des « cartes » et des sous-dossiers (« dossiers »), sur autant de niveaux que tu veux.',
   'Chaque carte a un « recto » (la notion, le terme ou la question) et un « verso » (la définition, la formule ou la réponse). Pour aller à la ligne dans un texte, écris \\n.',
   'Les photos et les enregistrements audio s’ajoutent ensuite dans l’application, en modifiant une carte.',
-  'Tu peux réimporter le même fichier enrichi (par exemple avec un nouveau chapitre) : les dossiers de même nom et les cartes de même recto sont reconnus, seuls les nouveaux éléments sont ajoutés, les versos modifiés sont mis à jour et ta progression est conservée.',
+  'Tu peux réimporter le même fichier enrichi (par exemple avec un nouveau chapitre) : les dossiers de même nom et les cartes de même recto sont reconnus, seuls les nouveaux éléments sont ajoutés, les versos modifiés dans le fichier sont mis à jour, sauf ceux que tu as corrigés dans l’application, qui sont conservés. Ta progression est conservée.',
 ].join('\n');
 
 /**

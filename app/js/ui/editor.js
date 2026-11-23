@@ -452,7 +452,8 @@ async function runEditor({ cardId = null, folderId = null } = {}) {
 
     /* --- close --- */
     let closed = false;
-    const layer = { el: overlay, onEscape: () => requestClose() };
+    // Escape / Android back ask before dropping changes; a route change does not close the editor.
+    const layer = { el: overlay, onEscape: () => requestClose(), keepOnNavigate: true };
 
     async function requestClose() {
       if (st.saving || closed) return;

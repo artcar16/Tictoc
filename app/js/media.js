@@ -3,6 +3,7 @@
 // Overlays are styled by css/media.css (injected once), which uses the design tokens of style.css.
 
 import { formatBytes } from './util.js';
+import { watchClose } from './back.js';
 
 /* ------------------------------------------------------------------ */
 /* Constants                                                           */
@@ -184,6 +185,8 @@ function onOverlayKeyDown(e) {
 /** Show an overlay element on top of everything. */
 function openOverlay(node, { onEscape, onKey, initialFocus }) {
   const entry = { el: node, onEscape, onKey, restoreFocus: document.activeElement };
+  // Android back button / gesture: same as Escape (cancel), instead of leaving the screen below.
+  entry.unwatch = watchClose(() => entry.onEscape());
   overlayStack.push(entry);
   if (overlayStack.length === 1) {
     document.documentElement.classList.add('media-lock');
@@ -200,6 +203,7 @@ function openOverlay(node, { onEscape, onKey, initialFocus }) {
 }
 
 function closeOverlay(entry) {
+  entry.unwatch?.();
   const i = overlayStack.indexOf(entry);
   if (i >= 0) overlayStack.splice(i, 1);
   if (!overlayStack.length) {

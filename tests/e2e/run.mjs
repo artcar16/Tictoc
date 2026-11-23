@@ -12,9 +12,10 @@
 
 import { createRequire } from 'node:module';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:http';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { startServer } from '../../scripts/serve.mjs';
+import { createHandler, startServer } from '../../scripts/serve.mjs';
 import { FORMAT_EXAMPLE, buildAIPrompt } from '../../app/js/format.js';
 
 const require = createRequire(import.meta.url);
@@ -169,19 +170,28 @@ async function pickFileVia(trigger, file) {
   await chooser.setFiles(file);
 }
 
-/** Text of the card currently asked in the study screen. */
-async function question() {
-  const q = page.locator('.flashcard .fc-q .face-text');
-  return (await q.first().innerText()).trim();
+/** Displayed text of a card face, as stored (the display puts non-breaking spaces before « : ; ? ! »). */
+async function faceText(locator) {
+  return (await locator.first().innerText()).replace(/\u00A0/g, ' ').trim();
 }
 
+/** Text of the card currently asked in the study screen. */
+function question() {
+  return faceText(page.locator('.flashcard .fc-q .face-text'));
+}
+
+/** The study screen ignores a tap within 300 ms of the previous reveal / answer (double tap). */
+const TAP_GAP = 320;
+
 /** Tap « Afficher la réponse ». A tap within 300 ms of an answer counts as a double tap and is
- *  ignored by the app, so retry like a user would. */
+ *  ignored by the app, so retry like a user would. Then wait as long as a user reads the answer:
+ *  an answer tapped right after the reveal would be ignored too. */
 async function showAnswer() {
   for (let i = 0; i < 4; i++) {
     await btn('Afficher la réponse').click();
     try {
       await page.locator('.flashcard.is-revealed').waitFor({ timeout: 450 });
+      await settle(TAP_GAP);
       return;
     } catch {
       /* swallowed as a double tap: tap again */
@@ -199,6 +209,7 @@ async function revealAndAnswer(known, how = 'button') {
   }
   await showAnswer();
   await btn(known ? 'Je sais' : 'Je ne sais pas').click();
+  await settle(TAP_GAP);
 }
 
 async function remaining() {
@@ -211,7 +222,10 @@ async function remaining() {
 async function finishSession(how = 'keys') {
   const seen = [];
   for (let i = 0; i < 400; i++) {
-    if (await page.locator('.end').count()) return seen;
+    if (await page.locator('.end').count()) {
+      await settle(TAP_GAP); // the end screen ignores a tap right after the last answer
+      return seen;
+    }
     const before = await question();
     seen.push(before);
     await revealAndAnswer(true, how);
@@ -514,19 +528,47 @@ try {
   });
 
   await step('Données : réimport avec un chapitre de plus et un verso modifié', async () => {
-    await page.locator('#imp-text').fill(course({ chapters: 7, changed: true }));
+    // First, corrections typed in the app: a re-import of the course file must never undo them.
+    await go(`#/cards/${await folderId('Chapitre 2 - Le bilan')}`, '.card-row');
+    const fix = async (front, field, value) => {
+      await page.locator('.card-row', { hasText: front }).click();
+      const editor = dialog('Éditeur de carte');
+      await editor.waitFor();
+      await editor.locator(field).fill(value);
+      await btn('Enregistrer', editor).click();
+      await editor.waitFor({ state: 'detached' });
+      await page.locator('.card-row', { hasText: value.startsWith('Notion') ? value : front }).waitFor();
+    };
+    await fix('Notion 2.03', '#ed-back', 'Ma correction du verso 2.03');
+    await fix('Notion 2.04', '#ed-front', 'Notion 2.04 (corrigée)');
+    await go('#/cards', '.page-title'); // the Cartes tab remembers its folder: back to the root
+    await tab('data');
+    // The file changes 2.05 (untouched in the app) and 2.03 (corrected in the app).
+    const json = course({ chapters: 7, changed: true }).replace(
+      'Définition 2.03 : explication de la notion numéro 3 du chapitre 2.',
+      'Définition 2.03 : autre version proposée par le fichier.',
+    );
+    await page.locator('#imp-text').fill(json);
     await btn('Analyser').click();
     await page.locator('.preview-card').waitFor();
     const s = await summaryCells();
     eq(s['dossier créé'], 1, 'dossier créé');
     eq(s['dossiers réutilisés'], 8, 'dossiers réutilisés');
-    eq(s['cartes nouvelles'], 15, 'cartes nouvelles');
+    eq(s['cartes nouvelles'], 15, 'cartes nouvelles (pas de doublon pour le recto corrigé)');
     eq(s['mise à jour'], 1, 'mise à jour');
-    eq(s['inchangées'], 94, 'inchangées');
+    eq(s['inchangées'], 93, 'inchangées');
+    const updates = await page.locator('.import-updates').innerText();
+    assert(/Notion 2\.05/.test(updates) && /nouvelle version enrichie/.test(updates), `versos remplacés : ${updates}`);
+    await page.locator('.import-kept', { hasText: '1 carte corrigée dans l’app' }).waitFor();
+    const warnings = await page.locator('.preview-card .warnings:not(.is-info)').innerText();
+    assert(/« Notion 2\.03 » : verso modifié dans l’app, conservé/.test(warnings), `avertissements : ${warnings}`);
     await btn('Importer').click();
     await page.locator('.notice.is-success').waitFor();
     eq((await cardByFront('Notion 2.05')).back.text, 'Définition 2.05 : nouvelle version enrichie.', 'verso mis à jour');
-    eq((await db('getCards')).length, 113, 'cartes en base');
+    eq((await cardByFront('Notion 2.03')).back.text, 'Ma correction du verso 2.03', 'verso corrigé dans l’app conservé');
+    const all = await db('getCards');
+    eq(all.filter((c) => c.front.text.startsWith('Notion 2.04')).length, 1, 'une seule carte 2.04');
+    eq(all.length, 113, 'cartes en base');
   });
 
   await step('Données : import dans un dossier choisi (depuis le dossier)', async () => {
@@ -686,6 +728,100 @@ try {
     eq((await cardByFront('Notion 5.15')).folderId, ch6, 'dossier de la carte');
   });
 
+  await step('Retour Android / Échap : ferment la feuille ou l’éditeur, jamais l’écran dessous', async () => {
+    const ch5 = await folderId('Chapitre 5 - Les provisions');
+    await go(`#/cards/${ch5}`, '.card-row');
+    const hash = new URL(page.url()).hash;
+    const cards0 = (await db('getCards')).length;
+    // Android's back button / gesture is a close request to the most recent open CloseWatcher
+    // (history.back() when there is none). Recorded here so the test can send one.
+    await page.evaluate(() => {
+      const Native = window.CloseWatcher;
+      if (typeof Native !== 'function') throw new Error('CloseWatcher absent de ce Chromium');
+      const open = [];
+      const drop = (w) => {
+        const i = open.indexOf(w);
+        if (i >= 0) open.splice(i, 1);
+      };
+      window.__e2eCloseWatcher = { Native, open };
+      window.CloseWatcher = class extends Native {
+        constructor(...args) {
+          super(...args);
+          open.push(this);
+          this.addEventListener('close', () => drop(this));
+        }
+        destroy() {
+          drop(this);
+          super.destroy();
+        }
+      };
+    });
+    const androidBack = () =>
+      page.evaluate(() => {
+        const { open } = window.__e2eCloseWatcher;
+        if (open.length) open[open.length - 1].close();
+        else history.back();
+      });
+    const sameScreen = async (label) => {
+      eq(new URL(page.url()).hash, hash, `${label} : l’écran dessous n’a pas changé`);
+      await page.getByRole('heading', { name: 'Chapitre 5 - Les provisions' }).waitFor();
+    };
+    const abandon = page.getByRole('dialog', { name: 'Abandonner les modifications ?' });
+
+    // A sheet: back closes it.
+    await page.getByRole('button', { name: 'Options du dossier' }).click();
+    await btn('Renommer', dialog()).waitFor();
+    await androidBack();
+    await page.locator('.sheet-backdrop').waitFor({ state: 'detached' });
+    await sameScreen('feuille');
+
+    // The editor with a card being written: back asks first, « Continuer » keeps it.
+    await page.getByRole('button', { name: 'Ajouter' }).click();
+    await btn('Nouvelle carte', dialog()).click();
+    const editor = dialog('Éditeur de carte');
+    await editor.waitFor();
+    await page.locator('#ed-front').fill('Carte en cours');
+    await androidBack();
+    await abandon.waitFor();
+    await btn('Continuer', abandon).click();
+    await abandon.waitFor({ state: 'detached' });
+    await sameScreen('éditeur');
+    // Back again (watched again after « Continuer »), then back on the question itself.
+    await androidBack();
+    await abandon.waitFor();
+    await androidBack();
+    await abandon.waitFor({ state: 'detached' });
+    eq(await page.locator('#ed-front').inputValue(), 'Carte en cours', 'texte conservé');
+    // Escape still closes one overlay at a time (no second close from the same key).
+    await page.locator('#ed-front').focus();
+    await page.keyboard.press('Escape');
+    await abandon.waitFor();
+    eq(await abandon.count(), 1, 'une seule confirmation');
+    await page.keyboard.press('Escape');
+    await abandon.waitFor({ state: 'detached' });
+    await settle(250);
+    eq(await abandon.count(), 0, 'Échap ne ferme que la confirmation');
+    assert(await editor.isVisible(), 'l’éditeur reste ouvert');
+    await androidBack();
+    await btn('Abandonner', abandon).click();
+    await editor.waitFor({ state: 'detached' });
+    await sameScreen('abandon');
+    eq((await db('getCards')).length, cards0, 'aucune carte créée');
+
+    // Without CloseWatcher (other browsers) back changes the screen: its open sheet goes with it.
+    await page.evaluate(() => {
+      window.CloseWatcher = window.__e2eCloseWatcher.Native;
+    });
+    await page.getByRole('button', { name: 'Options du dossier' }).click();
+    await btn('Supprimer', dialog()).waitFor();
+    await page.evaluate(() => {
+      location.hash = '#/cards';
+    });
+    await page.locator('.page-title', { hasText: 'Cartes' }).waitFor();
+    await page.locator('.sheet-backdrop').waitFor({ state: 'detached' });
+    eq(await page.getByRole('dialog').count(), 0, 'aucune feuille restée ouverte sur l’autre écran');
+  });
+
   await step('Cartes : créer dossier, sous-dossier et cartes à la main', async () => {
     await go('#/cards', '.page-title');
     await page.getByRole('button', { name: 'Ajouter' }).click();
@@ -804,6 +940,11 @@ try {
     eq(await remaining(), 20, 'restantes au départ');
     const a = await question();
     eq(a, 'Notion 1.01 : le patrimoine', 'première carte (ordre du cours)');
+    // French typography on the card, display only: « : » never starts a line on its own.
+    assert((await page.locator('.flashcard .fc-q .face-text').textContent()).includes('1.01\u00A0: le'), 'espace insécable avant « : »');
+    // The card is content (not a role=button whose label would hide the question and the answer).
+    eq(await page.locator('.flashcard[role], .flashcard[aria-label]').count(), 0, 'carte lisible par un lecteur d’écran');
+    eq(await page.locator('.flashcard .fc-inner[aria-live="polite"]').count(), 1, 'réponse annoncée');
     await page.locator('.flashcard .fc-q .media-audio-btn').waitFor();
     await shot('04-etude-question');
     await showAnswer();
@@ -896,6 +1037,31 @@ try {
     await waitFor(async () => (await question()) !== q3, { message: '1 = je ne sais pas' });
   });
 
+  await step('Étude : un double tap sur « Afficher la réponse » ne répond pas à la place de l’élève', async () => {
+    for (const side of [0.75, 0.25]) {
+      await settle(TAP_GAP);
+      const r0 = await remaining();
+      const q = await question();
+      const id = (await cardByFront(q)).id;
+      const p0 = JSON.stringify(await db('getProgress', ctx.method, id));
+      // The second tap lands where « Je sais » (right half) / « Je ne sais pas » (left) just appeared.
+      const box = await btn('Afficher la réponse').boundingBox();
+      const x = box.x + box.width * side;
+      const y = box.y + box.height / 2;
+      await page.touchscreen.tap(x, y);
+      await page.waitForTimeout(120);
+      await page.touchscreen.tap(x, y);
+      await settle(TAP_GAP);
+      assert(await page.locator('.flashcard.is-revealed').count(), 'la réponse est affichée');
+      eq(await question(), q, 'toujours la même carte');
+      eq(await remaining(), r0, 'aucune réponse enregistrée');
+      eq(JSON.stringify(await db('getProgress', ctx.method, id)), p0, 'progression inchangée');
+      // Read, then answer for real.
+      await btn('Je sais').click();
+      await waitFor(async () => (await question()) !== q, { message: 'carte suivante' });
+    }
+  });
+
   await step('Étude : modifier la carte en cours depuis la séance', async () => {
     await showAnswer();
     const q = await question();
@@ -950,8 +1116,18 @@ try {
     await page.locator('.flashcard').waitFor();
     eq(await remaining(), 1, 'une seule carte');
     eq(await question(), ctx.failedB, 'la carte ratée');
-    await revealAndAnswer(true);
+    // A double tap on the last « Je sais »: the second tap lands on the end screen's buttons and
+    // must not leave it (nor start another session).
+    await showAnswer();
+    const yes = await btn('Je sais').boundingBox();
+    for (const dy of [0, 0]) {
+      await page.touchscreen.tap(yes.x + yes.width / 2, yes.y + yes.height / 2 + dy);
+      await page.waitForTimeout(150);
+    }
     await page.locator('.end').waitFor();
+    await settle(TAP_GAP);
+    assert(/Session terminée/.test(await page.locator('.end').innerText()), 'écran de fin toujours affiché');
+    assert(new URL(page.url()).hash.startsWith('#/study/'), `écran de fin quitté : ${page.url()}`);
     await btn('+10 nouvelles cartes').waitFor();
     await btn('Retour').click();
     await page.getByText("Rien à réviser pour aujourd'hui ✓").waitFor();
@@ -1018,6 +1194,34 @@ try {
     eq(await progressSnapshot(ctx.method), before, 'progression inchangée');
   });
 
+  await step('Navigations rapprochées : l’écran quitté est bien fermé (raccourcis, médias)', async () => {
+    const keydownListeners = async () => {
+      const cdp = await page.context().newCDPSession(page);
+      try {
+        const { result } = await cdp.send('Runtime.evaluate', { expression: 'document' });
+        const { listeners } = await cdp.send('DOMDebugger.getEventListeners', { objectId: result.objectId });
+        return listeners.filter((l) => l.type === 'keydown').length;
+      } finally {
+        await cdp.detach();
+      }
+    };
+    await go('#/cards', '.folder-row');
+    const base = await keydownListeners();
+    await go(`#/practice/folder/${ctx.compta}`, '.flashcard');
+    eq(await keydownListeners(), base + 1, 'raccourcis de l’écran d’étude');
+    // Two navigations 1 ms apart (✕ then a back gesture): the second screen may be ready first.
+    await page.evaluate(() => {
+      location.hash = '#/';
+      setTimeout(() => {
+        location.hash = '#/cards';
+      }, 1);
+    });
+    await page.locator('.page-title', { hasText: 'Cartes' }).waitFor();
+    await settle(400);
+    eq(new URL(page.url()).hash, '#/cards', 'écran final');
+    eq(await keydownListeners(), base, 'l’écran d’étude quitté a retiré ses raccourcis');
+  });
+
   /* ================================================================ */
   /* Next days                                                         */
   /* ================================================================ */
@@ -1058,13 +1262,14 @@ try {
     for (let i = 0; i < 60 && !(await page.locator('.end').count()); i++) {
       await page.keyboard.press('Space');
       await page.locator('.flashcard.is-revealed').waitFor();
-      seen.push((await page.locator('.flashcard .fc-a .face-text').first().innerText()).trim());
+      seen.push(await faceText(page.locator('.flashcard .fc-a .face-text')));
       await page.keyboard.press('ArrowRight');
       await waitFor(async () => (await page.locator('.end').count()) > 0 || (await page.locator('.flashcard:not(.is-revealed)').count()) > 0);
     }
     await page.locator('.end').waitFor();
     assert(seen.includes('Notion 4.01'), 'les cartes du chapitre 4 sont apparues');
     eq(seen.length, 41, 'cartes vues');
+    await settle(TAP_GAP);
     await btn('Retour').click();
     await page.locator('.hero').waitFor();
     await page.getByLabel('Sens').selectOption('front');
@@ -1149,6 +1354,27 @@ try {
       const sort = (l) => JSON.stringify([...l].sort((a, b) => String(a.id).localeCompare(String(b.id))));
       eq(sort(after[k]), sort(before[k]), `${k} identiques après restauration`);
     }
+    const lines = readFileSync(file, 'utf8').split('\n');
+    eq(lines.length, 4, 'une ligne par média dans le fichier');
+    // A single-line backup made by the previous version still restores (read in one go).
+    const counts = await page.evaluate(async () => {
+      const mod = await import(new URL('./js/db.js', location.href).href);
+      const legacy = new File([JSON.stringify(await mod.exportBackup())], 'ancienne.json');
+      return mod.restoreBackupFile(legacy);
+    });
+    eq(counts.media, 2, 'ancienne sauvegarde : médias');
+    eq(counts.cards, before.cards.length, 'ancienne sauvegarde : cartes');
+    // The backup chosen by mistake under « Importer des cartes »: recognised without being loaded
+    // into the text box, and restorable from there.
+    await pickFileVia(() => btn('Choisir un fichier .json').click(), file);
+    const found = page.locator('.import-preview .notice', { hasText: 'sauvegarde complète' });
+    await found.waitFor();
+    eq(await page.locator('#imp-text').inputValue(), '', 'sauvegarde pas mise dans la zone de texte');
+    await btn('Restaurer cette sauvegarde').click();
+    await confirmIn('Restaurer cette sauvegarde ?', 'Tout remplacer');
+    await found.waitFor({ state: 'detached' }); // the screen was refreshed after the restore
+    eq(await page.locator('#imp-text').inputValue(), '', 'rien à réanalyser après la restauration');
+    eq((await db('getCards')).length, before.cards.length, 'cartes après restauration depuis l’import');
     await go(`#/method/${ctx.method}`, '.hero');
     await page.getByRole('heading', { name: 'Partiel du 15 janvier' }).waitFor();
     await go('#/cards', '.page-title');
@@ -1159,6 +1385,124 @@ try {
     await page.getByRole('button', { name: 'Fermer' }).first().click();
     await editor.waitFor({ state: 'detached' });
     await page.locator('.search-input').fill('');
+  });
+
+  await step('Étude : carte supprimée pendant la séance, puis passage à 4 h avant la fin', async () => {
+    const lab = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, locale: 'fr-FR', timezoneId: 'Europe/Paris' });
+    // Date shifted by window.__e2eShift ms, changeable while the page runs.
+    await lab.addInitScript(() => {
+      const RealDate = Date;
+      globalThis.__e2eShift = 0;
+      class ShiftedDate extends RealDate {
+        constructor(...a) {
+          if (a.length) super(...a);
+          else super(RealDate.now() + globalThis.__e2eShift);
+        }
+        static now() {
+          return RealDate.now() + globalThis.__e2eShift;
+        }
+      }
+      globalThis.Date = ShiftedDate;
+    });
+    const main = page;
+    try {
+      page = await lab.newPage();
+      watch(page);
+      await page.goto(BASE);
+      await page.getByText('Aucune méthode de révision').waitFor();
+      const methodId = await page.evaluate(async () => {
+        const mod = await import(new URL('./js/db.js', location.href).href);
+        const f = await mod.createFolder({ name: 'Chapitre test' });
+        for (const n of [1, 2, 3, 4]) await mod.createCard({ folderId: f.id, front: `Q${n}`, back: `R${n}` });
+        const m = await mod.createMethod({ name: 'Méthode test' });
+        await mod.updateMethod(m.id, { rules: { [`f:${f.id}`]: true } });
+        return m.id;
+      });
+      await go(`#/study/${methodId}`, '.flashcard');
+      eq(await remaining(), 4, 'file');
+      eq(await question(), 'Q1', 'première carte');
+      await revealAndAnswer(true, 'keys');
+      await waitFor(async () => (await question()) === 'Q2', { message: 'Q2' });
+      // Q2 (new) deleted from the session's ✎ editor.
+      await page.getByRole('button', { name: 'Modifier la carte' }).click();
+      const editor = dialog('Éditeur de carte');
+      await editor.waitFor();
+      await btn('Supprimer la carte', editor).click();
+      await confirmIn('Supprimer la carte ?', 'Supprimer');
+      await editor.waitFor({ state: 'detached' });
+      await waitFor(async () => (await question()) === 'Q3', { message: 'Q3' });
+      await revealAndAnswer(true, 'keys');
+      // The study day changes (4 am, or the phone left on this screen overnight).
+      await page.evaluate(() => {
+        globalThis.__e2eShift = 86400000;
+      });
+      await waitFor(async () => (await question()) === 'Q4', { message: 'Q4' });
+      await revealAndAnswer(true, 'keys');
+      await page.locator('.end').waitFor();
+      await settle(TAP_GAP);
+      const text = await page.locator('.end').innerText();
+      assert(/3\s*cartes révisées/.test(text), `cartes révisées : ${text}`);
+      assert(/Encore 2 cartes à réviser aujourd'hui/.test(text), `cartes dues depuis le changement de jour : ${text}`);
+      assert(!/Prochaine révision/.test(text), `« prochaine révision » alors que des cartes sont dues : ${text}`);
+      eq(await page.getByRole('button', { name: /nouvelles? cartes?$/ }).count(), 0, 'pas de « +1 nouvelle carte » pour la carte supprimée');
+      await btn('Continuer (2)').click();
+      await page.locator('.flashcard').waitFor();
+      eq(await remaining(), 2, 'les 2 cartes du nouveau jour');
+      await finishSession('keys');
+      const end = await page.locator('.end').innerText();
+      assert(/Prochaine révision : demain \(1 carte\)/.test(end), `fin : ${end}`);
+    } finally {
+      page = main;
+      await lab.close().catch(() => {});
+    }
+  });
+
+  await step('Stockage plein : message clair en français, aucune donnée touchée', async () => {
+    // A separate, fresh profile: Chromium only applies a quota override set before the first write.
+    const full = await browser.newContext({ viewport: { width: 390, height: 844 } });
+    try {
+      const p = await full.newPage();
+      const cdp = await full.newCDPSession(p);
+      await p.goto(BASE);
+      await cdp.send('Storage.overrideQuotaForOrigin', { origin: new URL(BASE).origin, quotaSize: 2_500_000 });
+      const r = await p.evaluate(async () => {
+        const mod = await import(new URL('./js/db.js', location.href).href);
+        const { errorMessage } = await import(new URL('./js/ui/components.js', location.href).href);
+        // Photos do not compress: random bytes, like a JPEG.
+        const photo = (n) => {
+          const a = new Uint8Array(n);
+          for (let i = 0; i < n; i += 65536) crypto.getRandomValues(a.subarray(i, i + 65536));
+          return new Blob([a], { type: 'image/jpeg' });
+        };
+        const folder = await mod.createFolder({ name: 'Chapitre 1' });
+        const imageId = await mod.putMedia(photo(1_500_000)); // fits
+        await mod.createCard({ folderId: folder.id, front: { text: 'Bilan', imageId }, back: 'Photographie du patrimoine' });
+        const out = {};
+        try {
+          await mod.putMedia(photo(4_000_000)); // does not fit
+        } catch (err) {
+          out.save = { name: err.name, message: errorMessage(err) };
+        }
+        try {
+          // Old and new content are both counted until the restore commits: it does not fit either.
+          await mod.restoreBackupFile(await mod.exportBackupFile('b.json'));
+        } catch (err) {
+          out.restore = errorMessage(err);
+        }
+        const after = await mod.exportBackup();
+        out.cards = after.cards.map((c) => c.front.imageId === imageId && c.front.text);
+        out.media = after.media.length;
+        return out;
+      });
+      assert(r.save, 'l’enregistrement aurait dû être refusé');
+      eq(r.save.name, 'QuotaExceededError', 'erreur du navigateur');
+      assert(/^plus assez d’espace de stockage sur ce téléphone\. Libère de la place/.test(r.save.message), `message : ${r.save.message}`);
+      assert(/^Restauration impossible, aucune donnée modifiée : plus assez d’espace/.test(r.restore || ''), `restauration : ${r.restore}`);
+      eq(JSON.stringify(r.cards), '["Bilan"]', 'carte intacte');
+      eq(r.media, 1, 'photo intacte');
+    } finally {
+      await full.close();
+    }
   });
 
   /* ================================================================ */
@@ -1176,6 +1520,65 @@ try {
     await page.getByRole('button', { name: 'Fermer' }).click();
     await page.locator('.hero').waitFor();
     await context.setOffline(false);
+  });
+
+  await step('Réseau bloqué : l’app démarre depuis le cache après un seul délai d’attente', async () => {
+    // A connection that hangs instead of failing (metro, Wi-Fi without internet): the server accepts
+    // the requests but never answers. Own server and context (another origin): the journey is untouched.
+    const appHandler = createHandler(join(ROOT, 'app'));
+    let stalled = false;
+    let deploy = '';
+    const hung = new Set();
+    const lab = createServer((req, res) => {
+      if (stalled) {
+        hung.add(res);
+        return;
+      }
+      const path = new URL(req.url || '/', 'http://localhost').pathname;
+      if (deploy && (path === '/' || path === '/index.html')) {
+        // A new deploy of the page, told apart by a <meta>.
+        const html = readFileSync(join(ROOT, 'app', 'index.html'), 'utf8').replace('<head>', `<head><meta name="e2e-deploy" content="${deploy}" />`);
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache' });
+        res.end(html);
+        return;
+      }
+      appHandler(req, res);
+    });
+    await new Promise((resolve) => lab.listen(0, '127.0.0.1', resolve));
+    const labContext = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, locale: 'fr-FR' });
+    try {
+      const p = await labContext.newPage();
+      watch(p);
+      await p.goto(`http://127.0.0.1:${lab.address().port}/`);
+      await p.getByText('Aucune méthode de révision').waitFor();
+      await p.waitForFunction(() => navigator.serviceWorker && navigator.serviceWorker.controller, null, { timeout: 10000 });
+
+      stalled = true;
+      const started = Date.now();
+      await p.reload({ waitUntil: 'commit', timeout: 20000 });
+      await p.getByText('Aucune méthode de révision').waitFor({ timeout: 20000 });
+      const ms = Date.now() - started;
+      assert(hung.size > 0, 'le serveur aurait dû recevoir des requêtes restées sans réponse');
+      // One network timeout (3 s) for the page, then the cached modules at once (it was ~4 × 3 s).
+      assert(ms < 5000, `démarrage trop lent sur réseau bloqué : ${ms} ms`);
+
+      // The network is back: after one quick answer the app goes network-first again,
+      // so a new deploy shows up on the next launch.
+      stalled = false;
+      for (const res of hung) res.destroy();
+      await p.reload();
+      await p.getByText('Aucune méthode de révision').waitFor();
+      deploy = '2';
+      await p.reload();
+      await p.getByText('Aucune méthode de révision').waitFor();
+      const served = await p.evaluate(() => document.querySelector('meta[name="e2e-deploy"]')?.content || null);
+      eq(served, '2', 'nouvelle version servie par le réseau');
+    } finally {
+      await labContext.close().catch(() => {});
+      for (const res of hung) res.destroy();
+      lab.closeAllConnections();
+      await new Promise((resolve) => lab.close(resolve));
+    }
   });
 
   await step('Mode sombre : couleurs sombres sur l’écran d’étude', async () => {

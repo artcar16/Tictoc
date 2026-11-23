@@ -1,7 +1,7 @@
 // Recto — entry point: hash router, tab bar, screen lifecycle, service worker registration.
 
 import { startRouter, parseHash, currentHash, navigate } from './ui/router.js';
-import { showError, errorBlock, loadingBlock, isOverlayOpen } from './ui/components.js';
+import { showError, errorBlock, loadingBlock, isOverlayOpen, closeTransientLayers } from './ui/components.js';
 import { renderMethods } from './ui/methods.js';
 import { renderMethod } from './ui/method.js';
 import { renderSelect } from './ui/select.js';
@@ -53,6 +53,7 @@ const view = document.getElementById('view');
 const tabbar = document.getElementById('tabbar');
 
 let current = null; // { hash, route, cleanups, dead, state, renderedAt }
+let displayed = null; // entry whose element is in #view
 let seq = 0;
 
 function kill(entry) {
@@ -93,6 +94,8 @@ async function render({ refresh = false } = {}) {
   const isRefresh = refresh || (current && current.hash === hash && !current.dead);
   const scrollY = isRefresh ? window.scrollY : 0;
   const state = isRefresh && current ? current.state : {};
+  // A dialog or sheet belongs to the screen that opened it: never leave it over another one.
+  if (!isRefresh) closeTransientLayers();
 
   if (route.tab) lastHashByTab[route.tab] = route.tab === 'data' ? TAB_ROOTS.data : hash;
 
@@ -123,6 +126,10 @@ async function render({ refresh = false } = {}) {
     if (swapped || entry.dead) return;
     swapped = true;
     kill(previous);
+    // When navigations overlap, `previous` may be a screen that never got displayed: also tear
+    // down the one really shown.
+    if (displayed && displayed !== entry) kill(displayed);
+    displayed = entry;
     updateChrome(route);
     view.replaceChildren(el);
     window.scrollTo(0, scrollY);

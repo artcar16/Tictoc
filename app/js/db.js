@@ -607,7 +607,9 @@ export async function setMeta(key, value) {
 
 /**
  * Apply a plan from importer.planImport in one transaction (folders + cards).
- * → { foldersCreated, cardsCreated, cardsUpdated }
+ * Every imported card records the texts it came from (`card.imported = { front, back }`): a later
+ * import only replaces a verso that still equals its imported text, never one corrected in the app.
+ * → { foldersCreated, cardsCreated, cardsUpdated, cardsKept }
  */
 export async function applyImportPlan(plan) {
   if (!plan || !Array.isArray(plan.newFolders) || !Array.isArray(plan.newCards) || !Array.isArray(plan.updatedCards)) {
@@ -644,35 +646,101 @@ export async function applyImportPlan(plan) {
       });
     }
     for (const c of plan.newCards) {
+      const front = cleanFace(c.front);
+      const back = cleanFace(c.back);
       cardStore.add({
         id: uid(),
         folderId: resolve(c.folderRef),
-        front: cleanFace(c.front),
-        back: cleanFace(c.back),
+        front,
+        back,
         order: Number.isFinite(c.order) ? c.order : 0,
         createdAt: now,
         updatedAt: now,
+        imported: { front: front.text, back: back.text },
       });
     }
 
     const current = await Promise.all(plan.updatedCards.map((u) => req(cardStore.get(u.id))));
     let cardsUpdated = 0;
+    let cardsKept = Array.isArray(plan.keptCards) ? plan.keptCards.length : 0;
     current.forEach((card, i) => {
       if (!card) return; // deleted meanwhile
-      const back = { ...normalizeFace(card.back), text: String(plan.updatedCards[i].back ?? '').trim() };
-      cardStore.put({ ...card, back, updatedAt: now });
+      // Last line of defence: never overwrite a verso the user typed (edited since the analysis,
+      // or a card created in the app).
+      const imp = card.imported;
+      const untouched = imp && typeof imp.back === 'string' && String(card.back?.text ?? '').trim() === imp.back.trim();
+      if (!untouched) {
+        cardsKept++;
+        return;
+      }
+      const text = String(plan.updatedCards[i].back ?? '').trim();
+      const back = { ...normalizeFace(card.back), text };
+      const front = typeof imp.front === 'string' ? imp.front : String(card.front?.text ?? '');
+      cardStore.put({ ...card, back, updatedAt: now, imported: { front, back: text } });
       cardsUpdated++;
     });
 
-    return { foldersCreated: plan.newFolders.length, cardsCreated: plan.newCards.length, cardsUpdated };
+    return { foldersCreated: plan.newFolders.length, cardsCreated: plan.newCards.length, cardsUpdated, cardsKept };
   });
 }
 
 /* ------------------------------------------------------------------------ */
 /* Backup                                                                   */
 /* ------------------------------------------------------------------------ */
+//
+// A backup is one JSON object (format v1, spec §7). Media can weigh hundreds of MB, so the file is
+// never built or read as one big string: exportBackupFile writes ONE MEDIA PER LINE and the restore
+// reads the file line by line. The layout stays plain JSON, readable by JSON.parse:
+//
+//   {"app":"recto","kind":"backup",…,"meta":[…],"media":[      ← line 1: everything but the media
+//   {"id":"…","type":"image/jpeg","size":…,"createdAt":…,"data":"<base64>"},
+//   {"id":"…",…}
+//   ]}
+//
+// (A raw line break never occurs inside JSON.stringify output, nor inside a UTF-8 multi-byte sequence.)
 
-/** Whole database as a JSON-serialisable object (media as base64). */
+const BACKUP_CHUNK = 4 * 1024 * 1024;
+const MEDIA_OPEN = '"media":[';
+
+function backupHead(small) {
+  return {
+    app: 'recto',
+    kind: 'backup',
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    folders: small.folders,
+    cards: small.cards,
+    methods: small.methods,
+    progress: small.progress,
+    meta: small.meta,
+  };
+}
+
+/** Media store record → backup entry (base64). */
+async function mediaEntry(m) {
+  const buffer = await toArrayBuffer(m.data);
+  return { id: m.id, type: m.type || '', size: buffer.byteLength, createdAt: m.createdAt ?? 0, data: arrayBufferToBase64(buffer) };
+}
+
+/** Backup entry → media store record (validated, base64 decoded). */
+function mediaRecord(m) {
+  if (!hasStringId(m) || typeof m.data !== 'string') throw invalidBackup('média incomplet.');
+  let data;
+  try {
+    data = base64ToArrayBuffer(m.data);
+  } catch {
+    throw invalidBackup('média illisible.');
+  }
+  return {
+    id: m.id,
+    type: typeof m.type === 'string' ? m.type : '',
+    data,
+    size: data.byteLength,
+    createdAt: Number.isFinite(m.createdAt) ? m.createdAt : 0,
+  };
+}
+
+/** Whole database as a JSON-serialisable object (media as base64). Small databases / tests only. */
 export async function exportBackup() {
   const data = await withTx(STORES, 'readonly', async (tx) => {
     const lists = await Promise.all(STORES.map((name) => req(tx.objectStore(name).getAll())));
@@ -680,28 +748,39 @@ export async function exportBackup() {
   });
   // Encoding happens after the transaction (it may need async Blob reads for legacy records).
   const media = [];
-  for (const m of data.media) {
-    const buffer = await toArrayBuffer(m.data);
-    media.push({
-      id: m.id,
-      type: m.type || '',
-      size: buffer.byteLength,
-      createdAt: m.createdAt ?? 0,
-      data: arrayBufferToBase64(buffer),
-    });
+  for (const m of data.media) media.push(await mediaEntry(m));
+  return { ...backupHead(data), media };
+}
+
+/**
+ * Assemble a backup File from the small stores and an (async) iterable of media records, holding
+ * at most one media in memory at a time: each one becomes its own Blob part.
+ */
+export async function buildBackupFile(name, small, mediaRecords) {
+  const head = JSON.stringify(backupHead(small));
+  const parts = [`${head.slice(0, -1)},${MEDIA_OPEN}`];
+  let sep = '\n';
+  for await (const m of mediaRecords) {
+    if (!m) continue; // deleted meanwhile
+    parts.push(new Blob([sep + JSON.stringify(await mediaEntry(m))]));
+    sep = ',\n';
   }
-  return {
-    app: 'recto',
-    kind: 'backup',
-    version: 1,
-    exportedAt: new Date().toISOString(),
-    folders: data.folders,
-    cards: data.cards,
-    methods: data.methods,
-    progress: data.progress,
-    meta: data.meta,
-    media,
-  };
+  parts.push('\n]}');
+  return new File(parts, name, { type: 'application/json' });
+}
+
+/** Whole database as a backup File (see the layout above). */
+export async function exportBackupFile(name) {
+  const names = STORES.filter((n) => n !== 'media');
+  const { small, mediaKeys } = await withTx(STORES, 'readonly', async (tx) => {
+    const lists = await Promise.all(names.map((n) => req(tx.objectStore(n).getAll())));
+    const keys = await req(tx.objectStore('media').getAllKeys());
+    return { small: Object.fromEntries(names.map((n, i) => [n, lists[i]])), mediaKeys: keys };
+  });
+  async function* records() {
+    for (const id of mediaKeys) yield await getOne('media', id); // one record in memory at a time
+  }
+  return buildBackupFile(name, small, records());
 }
 
 function invalidBackup(detail) {
@@ -734,30 +813,162 @@ function prepareBackup(obj) {
   if (!obj.meta.every((m) => isRecord(m) && typeof m.key === 'string')) throw invalidBackup('réglage sans clé.');
   if (!obj.media.every((m) => hasStringId(m) && typeof m.data === 'string')) throw invalidBackup('média incomplet.');
 
-  const media = obj.media.map((m) => {
-    let data;
-    try {
-      data = base64ToArrayBuffer(m.data);
-    } catch {
-      throw invalidBackup('média illisible.');
-    }
-    return {
-      id: m.id,
-      type: typeof m.type === 'string' ? m.type : '',
-      data,
-      size: data.byteLength,
-      createdAt: Number.isFinite(m.createdAt) ? m.createdAt : 0,
-    };
-  });
-
   return {
     folders: obj.folders.map((f) => ({ ...f, parentId: f.parentId ?? null })),
     cards: obj.cards.map((c) => ({ ...c, front: normalizeFace(c.front), back: normalizeFace(c.back) })),
     methods: obj.methods,
     progress: obj.progress.map((p) => ({ ...p, id: p.id || progressId(p.methodId, p.cardId) })),
     meta: obj.meta,
-    media,
+    media: obj.media.map(mediaRecord),
   };
+}
+
+/**
+ * Lines of `file` from byte `start`, as { text, end } (end = byte offset just after the line break).
+ * Reads `chunkSize` bytes at a time; a line may span several chunks.
+ */
+async function* fileLines(file, start, chunkSize) {
+  const decoder = new TextDecoder();
+  const decode = (pieces) => {
+    if (pieces.length === 1) return decoder.decode(pieces[0]);
+    const all = new Uint8Array(pieces.reduce((n, p) => n + p.length, 0));
+    let at = 0;
+    for (const p of pieces) {
+      all.set(p, at);
+      at += p.length;
+    }
+    return decoder.decode(all);
+  };
+  let pieces = [];
+  let pos = start;
+  while (pos < file.size) {
+    const bytes = new Uint8Array(await file.slice(pos, pos + chunkSize).arrayBuffer());
+    if (!bytes.length) break;
+    let from = 0;
+    for (let nl = bytes.indexOf(10); nl !== -1; nl = bytes.indexOf(10, from)) {
+      pieces.push(bytes.subarray(from, nl));
+      yield { text: decode(pieces), end: pos + nl + 1 };
+      pieces = [];
+      from = nl + 1;
+    }
+    if (from < bytes.length) pieces.push(bytes.subarray(from));
+    pos += bytes.length;
+  }
+  if (pieces.length) yield { text: decode(pieces), end: pos };
+}
+
+/** True when the file ends like exportBackupFile's layout ("\n]}"), checked without reading it all. */
+async function hasLineLayout(file) {
+  if (!file || typeof file.slice !== 'function' || !(file.size > 0)) return false;
+  const tail = await file.slice(Math.max(0, file.size - 32)).text();
+  return /\n\]\}\s*$/.test(tail);
+}
+
+/** Media lines of a line-layout backup, from byte `start` up to the closing "]}". */
+async function readMediaLines(file, start, chunkSize) {
+  const media = [];
+  let closed = false;
+  for await (const { text } of fileLines(file, start, chunkSize)) {
+    const line = text.trim();
+    if (!line) continue;
+    if (closed) throw invalidBackup('contenu inattendu après la fin du fichier.');
+    if (line === ']}') {
+      closed = true;
+      continue;
+    }
+    let entry;
+    try {
+      entry = JSON.parse(line.endsWith(',') ? line.slice(0, -1) : line);
+    } catch {
+      throw invalidBackup('média illisible.');
+    }
+    media.push(mediaRecord(entry)); // only the decoded ArrayBuffer is kept, not the base64 text
+  }
+  if (!closed) throw invalidBackup('fichier incomplet (coupé pendant la copie ?).');
+  return media;
+}
+
+/**
+ * Open a backup file without restoring it. → { head, read(), restore() }
+ *  - head: the backup object without its media (for the confirmation: date, counts). It may be any
+ *    JSON value: check head.app / head.kind before going further.
+ *  - read(): validated store records (media decoded), ready to be written. Pure, no database.
+ *  - restore(): read() then REPLACE everything with it in one transaction.
+ * Backups made by exportBackupFile are read line by line, one media at a time; any other JSON
+ * (older single-line backups) is parsed in one go. Throws a French error when it is not JSON.
+ */
+export async function openBackupFile(file, { chunkSize = BACKUP_CHUNK } = {}) {
+  let backup = null;
+  if (await hasLineLayout(file)) {
+    let first = null;
+    for await (const line of fileLines(file, 0, chunkSize)) {
+      first = line;
+      break;
+    }
+    const headText = first ? first.text.replace(/^\uFEFF/, '').trimEnd() : '';
+    if (headText.endsWith(MEDIA_OPEN)) {
+      let head = null;
+      try {
+        head = JSON.parse(`${headText}]}`);
+      } catch {
+        /* not our layout after all: parsed in one go below */
+      }
+      if (isRecord(head)) {
+        delete head.media;
+        backup = {
+          head,
+          read: async () => {
+            const records = prepareBackup({ ...head, media: [] }); // validates the head before reading media
+            records.media = await readMediaLines(file, first.end, chunkSize);
+            return records;
+          },
+        };
+      }
+    }
+  }
+  if (!backup) {
+    let obj;
+    try {
+      obj = JSON.parse((await file.text()).replace(/^\uFEFF/, ''));
+    } catch {
+      throw invalidBackup('ce fichier n’est pas un JSON valide.');
+    }
+    backup = { head: obj, read: async () => prepareBackup(obj) };
+  }
+  backup.restore = async () => writeBackup(await backup.read());
+  return backup;
+}
+
+/** Restore a backup File (see openBackupFile). → counts per store */
+export async function restoreBackupFile(file, options) {
+  return (await openBackupFile(file, options)).restore();
+}
+
+function isQuotaError(err) {
+  return !!err && (err.name === 'QuotaExceededError' || err.name === 'NS_ERROR_DOM_QUOTA_REACHED' || err.code === 22);
+}
+
+/** REPLACE all data with validated records, in one transaction (all-or-nothing). → counts per store */
+async function writeBackup(records) {
+  try {
+    await withTx(STORES, 'readwrite', (tx) => {
+      for (const name of STORES) {
+        const store = tx.objectStore(name);
+        store.clear();
+        for (const record of records[name]) store.put(record);
+      }
+    });
+  } catch (err) {
+    // The transaction was rolled back: the previous data is intact.
+    if (isQuotaError(err)) {
+      throw new Error(
+        'Restauration impossible, aucune donnée modifiée : plus assez d’espace de stockage sur ce téléphone (pendant la restauration, l’ancien et le nouveau contenu occupent la place en même temps). Libère de la place puis réessaie.',
+      );
+    }
+    const why = err && err.name === 'UnknownError' ? 'erreur du stockage du navigateur, le téléphone manque peut-être d’espace' : (err && (err.message || err.name)) || err;
+    throw new Error(`Restauration impossible, aucune donnée modifiée (${why}).`);
+  }
+  return Object.fromEntries(STORES.map((name) => [name, records[name].length]));
 }
 
 /**
@@ -772,20 +983,7 @@ export async function restoreBackup(obj) {
       throw invalidBackup('ce fichier n’est pas un JSON valide.');
     }
   }
-  const records = prepareBackup(obj); // validation + base64 decoding happen before the transaction
-  try {
-    await withTx(STORES, 'readwrite', (tx) => {
-      for (const name of STORES) {
-        const store = tx.objectStore(name);
-        store.clear();
-        for (const record of records[name]) store.put(record);
-      }
-    });
-  } catch (err) {
-    // The transaction was rolled back: the previous data is intact.
-    throw new Error(`Restauration impossible, aucune donnée modifiée (${(err && err.message) || err}).`);
-  }
-  return Object.fromEntries(STORES.map((name) => [name, records[name].length]));
+  return writeBackup(prepareBackup(obj)); // validation + base64 decoding happen before the transaction
 }
 
 /** Delete every record of every store. */

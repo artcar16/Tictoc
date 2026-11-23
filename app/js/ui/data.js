@@ -7,14 +7,17 @@ import * as importer from '../importer.js';
 import * as format from '../format.js';
 import * as media from '../media.js';
 import { plural, formatBytes } from '../util.js';
-import { h } from '../dom.js';
+import { h, frSpaces } from '../dom.js';
 import { icon } from './icons.js';
-import { pageHead, confirmDialog, guard, toast, copyText, folderOptions, errorMessage } from './components.js';
+import { pageHead, confirmDialog, guard, toast, copyText, folderOptions, errorMessage, isIOSBrowserTab, iosTabNotice } from './components.js';
 
 export const APP_VERSION = '1.0.0';
 
 const PERSIST_ASKED_KEY = 'persistRequested';
 const LAST_BACKUP_KEY = 'lastBackupAt';
+// A chosen file bigger than this (characters) is analysed without being put in the text box:
+// a huge text there freezes the phone for seconds.
+const MAX_TEXTAREA_CHARS = 1_000_000;
 
 function section(title, iconName, ...children) {
   return h(
@@ -64,6 +67,7 @@ export async function renderData(root, ctx) {
   const state = ctx.state;
 
   root.append(pageHead({ title: 'Données', subtitle: 'Import, sauvegarde et stockage' }));
+  if (isIOSBrowserTab()) root.append(iosTabNotice({ hasCards: cards.length > 0 }));
 
   /* ---------------------------------------------------------------- */
   /* 1. Import                                                         */
@@ -91,10 +95,12 @@ export async function renderData(root, ctx) {
   const pasteBtn = canPaste ? h('button', { type: 'button', class: 'btn btn-secondary' }, icon('paste', { size: 18 }), 'Coller') : null;
 
   let parsed = null; // last successful parseImport result
+  let parsedFile = null; // name of the (large) file `parsed` comes from, when not in the text box
   const resultBox = h('div');
 
   const resetPreview = () => {
     parsed = null;
+    parsedFile = null;
     preview.replaceChildren();
   };
 
@@ -110,15 +116,23 @@ export async function renderData(root, ctx) {
     }
     const s = plan.summary;
     const cell = (n, label) => h('div', { class: 'sum-cell' }, h('div', { class: 'sum-value' }, String(n)), h('div', { class: 'sum-label' }, label));
+    // Cards kept because they were corrected in the app are not something to import.
     const nothing = !s.foldersNew && !s.cardsNew && !s.cardsUpdated;
     const importBtn = h('button', { type: 'button', class: 'btn btn-primary btn-block btn-lg', disabled: nothing }, icon('download', { size: 20 }), 'Importer');
     importBtn.addEventListener('click', guard(() => doImport(), { busy: [importBtn, analyseBtn] }));
-    const warnings = parsed.warnings || [];
+    const warnings = [...(parsed.warnings || []), ...(plan.warnings || [])];
+    const kept = (plan.keptCards || []).length;
+    const cardById = new Map(cards.map((c) => [c.id, c]));
+    const list = (items, render) => [
+      h('ul', null, items.slice(0, 200).map(render)),
+      items.length > 200 ? h('p', { class: 'muted' }, `… et ${items.length - 200} autres.`) : null,
+    ];
     preview.replaceChildren(
       h(
         'div',
         { class: 'preview-card' },
         h('div', { class: 'preview-title' }, "Aperçu de l'import"),
+        parsedFile ? h('p', { class: 'hint import-file' }, icon('file', { size: 16 }), parsedFile) : null,
         h(
           'div',
           { class: 'sum-grid' },
@@ -128,13 +142,38 @@ export async function renderData(root, ctx) {
           cell(s.cardsUpdated, s.cardsUpdated > 1 ? 'mises à jour' : 'mise à jour'),
           cell(s.cardsUnchanged, s.cardsUnchanged > 1 ? 'inchangées' : 'inchangée'),
         ),
+        plan.updatedCards.length
+          ? h(
+              'details',
+              { class: 'warnings is-info import-updates', open: plan.updatedCards.length <= 5 },
+              h('summary', null, icon('edit', { size: 16 }), `${plural(plan.updatedCards.length, 'verso remplacé', 'versos remplacés')} par celui du fichier`),
+              ...list(plan.updatedCards, (u) => {
+                const card = cardById.get(u.id);
+                return h(
+                  'li',
+                  null,
+                  h('strong', null, card ? card.front.text || '(sans texte)' : '?'),
+                  ' : ',
+                  h('span', { class: 'change-old' }, card ? card.back.text || '(vide)' : ''),
+                  ' → ',
+                  u.back,
+                );
+              }),
+            )
+          : null,
+        kept
+          ? h(
+              'p',
+              { class: 'hint import-kept' },
+              `${plural(kept, 'carte corrigée', 'cartes corrigées')} dans l’app : ${kept > 1 ? 'leurs versos sont conservés' : 'son verso est conservé'}.`,
+            )
+          : null,
         warnings.length
           ? h(
               'details',
               { class: 'warnings', open: warnings.length <= 5 },
               h('summary', null, icon('alert', { size: 16 }), plural(warnings.length, 'avertissement')),
-              h('ul', null, warnings.slice(0, 200).map((w) => h('li', null, w))),
-              warnings.length > 200 ? h('p', { class: 'muted' }, `… et ${warnings.length - 200} autres.`) : null,
+              ...list(warnings, (w) => h('li', null, w)),
             )
           : null,
         nothing ? h('p', { class: 'hint' }, 'Rien de nouveau : toutes ces cartes sont déjà présentes.') : null,
@@ -143,9 +182,9 @@ export async function renderData(root, ctx) {
     );
   }
 
-  function analyse() {
+  /** Parse `text` (the text box by default; `fileName` when it comes from a file not shown there). */
+  function analyse(text = textarea.value, fileName = null) {
     state.importResult = null;
-    const text = textarea.value;
     if (!text.trim()) {
       resetPreview();
       preview.replaceChildren(h('div', { class: 'notice is-error' }, icon('alert', { size: 18 }), h('span', null, "Colle d'abord ton JSON, ou choisis un fichier.")));
@@ -154,11 +193,33 @@ export async function renderData(root, ctx) {
     const res = importer.parseImport(text);
     if (!res.ok) {
       parsed = null;
-      preview.replaceChildren(h('div', { class: 'notice is-error' }, icon('alert', { size: 18 }), h('span', null, res.error)));
+      parsedFile = null;
+      preview.replaceChildren(h('div', { class: 'notice is-error' }, icon('alert', { size: 18 }), h('span', null, frSpaces(res.error))));
       return;
     }
     parsed = res;
+    parsedFile = fileName;
     showPlan();
+  }
+
+  /** A full backup chosen in the import picker: say so, and offer to restore it from here. */
+  function showBackupFound(backup) {
+    textarea.value = '';
+    state.text = '';
+    state.importResult = null;
+    resultBox.replaceChildren();
+    resetPreview();
+    const restoreHere = h('button', { type: 'button', class: 'btn btn-secondary' }, icon('upload', { size: 18 }), 'Restaurer cette sauvegarde');
+    restoreHere.addEventListener('click', guard(() => restoreFrom(backup)));
+    preview.replaceChildren(
+      h(
+        'div',
+        { class: 'notice is-error' },
+        icon('alert', { size: 18 }),
+        h('span', null, frSpaces('Ce fichier est une sauvegarde complète, pas des cartes à importer. Pour remplacer tout le contenu par cette sauvegarde : « Restaurer cette sauvegarde ».')),
+      ),
+      h('div', { class: 'btn-row' }, restoreHere),
+    );
   }
 
   async function doImport() {
@@ -181,6 +242,7 @@ export async function renderData(root, ctx) {
     if (res.cardsCreated) parts.push(plural(res.cardsCreated, 'carte ajoutée', 'cartes ajoutées'));
     if (res.cardsUpdated) parts.push(plural(res.cardsUpdated, 'carte mise à jour', 'cartes mises à jour'));
     if (res.foldersCreated) parts.push(plural(res.foldersCreated, 'dossier créé', 'dossiers créés'));
+    if (res.cardsKept) parts.push(plural(res.cardsKept, 'carte corrigée conservée', 'cartes corrigées conservées'));
     toast(parts.length ? `Import terminé : ${parts.join(', ')}` : 'Import terminé');
     state.text = '';
     state.dest = target || '';
@@ -204,8 +266,24 @@ export async function renderData(root, ctx) {
     guard(async () => {
       const file = await media.pickFile({ accept: '.json,application/json,text/plain' });
       if (!file) return;
-      textarea.value = await file.text();
-      state.text = textarea.value;
+      // A backup is a .json too: recognised without loading it (it can weigh 100 MB with photos);
+      // db.openBackupFile reads only the beginning of the backups this app exports.
+      const backup = await db.openBackupFile(file).catch(() => null); // not JSON: a text to analyse
+      if (!ctx.alive()) return;
+      if (backup && importer.isBackupObject(backup.head)) {
+        showBackupFound(backup);
+        return;
+      }
+      const text = await file.text();
+      if (!ctx.alive()) return;
+      if (text.length > MAX_TEXTAREA_CHARS) {
+        textarea.value = '';
+        state.text = '';
+        analyse(text, file.name || 'fichier.json');
+        return;
+      }
+      textarea.value = text;
+      state.text = text;
       analyse();
     }),
   );
@@ -263,6 +341,7 @@ export async function renderData(root, ctx) {
       h('div', { class: 'btn-row' }, fileBtn, pasteBtn),
       h('div', { class: 'btn-row' }, analyseBtn),
       preview,
+      cards.length ? null : h('p', { class: 'hint' }, frSpaces('Pas encore de JSON ? Copie le prompt pour une IA dans « Format JSON », plus bas.')),
     ),
   );
   if (state.text && !state.importResult) analyse();
@@ -290,7 +369,7 @@ export async function renderData(root, ctx) {
     section(
       'Format JSON',
       'file',
-      h('div', { class: 'help' }, String(format.FORMAT_HELP || '').split('\n').filter(Boolean).map((p) => h('p', null, p))),
+      h('div', { class: 'help' }, String(format.FORMAT_HELP || '').split('\n').filter(Boolean).map((p) => h('p', null, frSpaces(p)))),
       h('pre', { class: 'code-block', tabindex: '0', 'aria-label': 'Exemple de JSON' }, h('code', null, format.FORMAT_EXAMPLE)),
       h('div', { class: 'btn-row' }, copyFormatBtn, copyPromptBtn),
       h('p', { class: 'hint' }, 'Colle ce prompt dans ChatGPT/Claude avec ton cours pour générer le JSON, puis colle la réponse ci-dessus.'),
@@ -304,9 +383,9 @@ export async function renderData(root, ctx) {
   exportBtn.addEventListener(
     'click',
     guard(async () => {
-      const backup = await db.exportBackup();
       const name = `recto-sauvegarde-${localDateKey()}.json`;
-      const file = new File([JSON.stringify(backup)], name, { type: 'application/json' });
+      // Built one media at a time: never the whole library as one string in memory.
+      const file = await db.exportBackupFile(name);
       let shared = false;
       if (isMobileDevice() && navigator.canShare?.({ files: [file] })) {
         const share = () => navigator.share({ files: [file], title: 'Sauvegarde Recto' });
@@ -345,41 +424,49 @@ export async function renderData(root, ctx) {
     guard(async () => {
       const file = await media.pickFile({ accept: '.json,application/json' });
       if (!file) return;
-      const text = await file.text();
-      let obj;
-      try {
-        obj = JSON.parse(text.replace(/^﻿/, ''));
-      } catch {
-        throw new Error("ce fichier n'est pas un JSON valide");
-      }
-      if (!obj || obj.app !== 'recto' || obj.kind !== 'backup') {
-        toast("Ce fichier n'est pas une sauvegarde Recto. Pour ajouter des cartes, utilise l'import JSON.", { duration: 4500 });
-        return;
-      }
-      const nCards = Array.isArray(obj.cards) ? obj.cards.length : 0;
-      const nMethods = Array.isArray(obj.methods) ? obj.methods.length : 0;
-      const when = obj.exportedAt ? new Date(obj.exportedAt) : null;
-      const whenText = when && !Number.isNaN(when.getTime()) ? ` du ${when.toLocaleDateString('fr-FR')}` : '';
-      const ok = await confirmDialog({
-        title: 'Restaurer cette sauvegarde ?',
-        message: `Sauvegarde${whenText} : ${plural(nCards, 'carte')}, ${plural(nMethods, 'méthode')}. Elle remplace tout le contenu actuel (cartes, méthodes, progression).`,
-        confirmLabel: 'Tout remplacer',
-        danger: true,
-      });
-      if (!ok) return;
-      await db.restoreBackup(obj);
-      window.dispatchEvent(new Event('recto:data-replaced'));
-      toast('Sauvegarde restaurée');
-      state.dest = '';
-      if (ctx.alive()) ctx.refresh();
+      // Reads only the beginning of the file (media are read during the restore, one at a time).
+      await restoreFrom(await db.openBackupFile(file));
     }),
   );
+
+  /** Confirm, then replace everything with `backup` (from db.openBackupFile). */
+  async function restoreFrom(backup) {
+    const head = backup.head;
+    if (!head || head.app !== 'recto' || head.kind !== 'backup') {
+      toast("Ce fichier n'est pas une sauvegarde Recto. Pour ajouter des cartes, utilise l'import JSON.", { duration: 4500 });
+      return;
+    }
+    const nCards = Array.isArray(head.cards) ? head.cards.length : 0;
+    const nMethods = Array.isArray(head.methods) ? head.methods.length : 0;
+    const when = head.exportedAt ? new Date(head.exportedAt) : null;
+    const whenText = when && !Number.isNaN(when.getTime()) ? ` du ${when.toLocaleDateString('fr-FR')}` : '';
+    const ok = await confirmDialog({
+      title: 'Restaurer cette sauvegarde ?',
+      message: `Sauvegarde${whenText} : ${plural(nCards, 'carte')}, ${plural(nMethods, 'méthode')}. Elle remplace tout le contenu actuel (cartes, méthodes, progression).`,
+      confirmLabel: 'Tout remplacer',
+      danger: true,
+    });
+    if (!ok) return;
+    await backup.restore();
+    window.dispatchEvent(new Event('recto:data-replaced'));
+    toast('Sauvegarde restaurée');
+    state.dest = '';
+    // Nothing left to analyse again on the refresh (the text may be a whole backup).
+    state.text = '';
+    state.importResult = null;
+    if (ctx.alive()) ctx.refresh();
+  }
   const lastBackupEl = h('p', { class: 'hint' }, sinceLabel(lastBackup));
   root.append(
     section(
       'Sauvegarde',
       'shield',
-      h('p', { class: 'help-text' }, 'Tes cartes et ta progression restent uniquement sur ce téléphone. Exporte une sauvegarde régulièrement (par exemple dans Fichiers ou Drive) pour ne rien perdre.'),
+      h(
+        'p',
+        { class: 'help-text' },
+        // iOS: Safari and the app added to the Home Screen do not share their data.
+        `Tes cartes et ta progression restent uniquement sur ce téléphone${'standalone' in navigator ? " (dans l'app ajoutée à l'écran d'accueil, pas dans Safari)" : ''}. Exporte une sauvegarde régulièrement (par exemple dans Fichiers ou Drive) pour ne rien perdre.`,
+      ),
       h('div', { class: 'btn-row' }, exportBtn, restoreBtn),
       lastBackupEl,
     ),

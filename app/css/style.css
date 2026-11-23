@@ -16,6 +16,9 @@
   --danger-soft: rgba(217, 72, 15, 0.1);
   --success: #2b8a3e;
   --success-soft: rgba(43, 138, 62, 0.11);
+  /* Darker variants for text and icons (contrast ≥ 4.5:1, also on the -soft tints). */
+  --danger-text: #b83c0c;
+  --success-text: #237032;
   --radius: 14px;
   --radius-sm: 10px;
   --radius-lg: 20px;
@@ -50,6 +53,8 @@
     --danger-soft: rgba(255, 138, 101, 0.13);
     --success: #69db7c;
     --success-soft: rgba(105, 219, 124, 0.13);
+    --danger-text: #ff8a65;
+    --success-text: #69db7c;
     --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 6px 20px rgba(0, 0, 0, 0.25);
     --shadow-lg: 0 2px 6px rgba(0, 0, 0, 0.35), 0 18px 48px rgba(0, 0, 0, 0.5);
     --backdrop: rgba(0, 0, 0, 0.58);
@@ -439,11 +444,11 @@ body.is-fullscreen .view {
 
 .btn-ghost.is-danger,
 .btn.is-danger {
-  color: var(--danger);
+  color: var(--danger-text);
 }
 
 .btn-danger {
-  background: var(--danger);
+  background: var(--danger-text);
   color: #fff;
 }
 
@@ -456,7 +461,7 @@ body.is-fullscreen .view {
 .btn-danger-outline {
   background: transparent;
   border-color: var(--danger);
-  color: var(--danger);
+  color: var(--danger-text);
 }
 
 .btn-dashed {
@@ -828,7 +833,7 @@ select.input,
 .notice.is-error {
   align-items: flex-start;
   background: var(--danger-soft);
-  color: var(--danger);
+  color: var(--danger-text);
 }
 
 .notice.is-error .icon {
@@ -842,7 +847,43 @@ select.input,
 }
 
 .notice.is-success > .icon {
-  color: var(--success);
+  color: var(--success-text);
+}
+
+.notice.is-info {
+  align-items: flex-start;
+  background: var(--accent-soft);
+  color: var(--text);
+}
+
+.notice.is-info > .icon {
+  flex: none;
+  margin-top: 2px;
+  color: var(--accent);
+}
+
+.notice-text {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+.notice-close {
+  flex: none;
+  width: 36px;
+  height: 36px;
+  margin: -8px -8px -8px 0;
+  color: var(--text-muted);
+}
+
+.import-file {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 4px 0 10px;
+  overflow-wrap: anywhere;
 }
 
 .notice-body {
@@ -862,7 +903,7 @@ select.input,
   padding: 10px 14px;
   border-radius: 12px;
   background: var(--danger-soft);
-  color: var(--danger);
+  color: var(--danger-text);
   font-size: 15px;
 }
 
@@ -1000,7 +1041,7 @@ select.input,
   margin-bottom: 4px;
   border-radius: 50%;
   background: var(--success-soft);
-  color: var(--success);
+  color: var(--success-text);
 }
 
 .done-title {
@@ -1241,6 +1282,24 @@ select.input,
   font-weight: 600;
 }
 
+/* Chapter titles are what the student chooses by: a folder name wraps on up to three lines
+   instead of being cut after a few words (« Chapitre 1 - La forma… »). Margin, not padding:
+   a clamped box shows the next line in its padding. */
+.tree-row.is-folder .tree-name.ellipsis,
+.folder-row .row-title.ellipsis {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+  line-height: 1.3;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.tree-row.is-folder .tree-name.ellipsis {
+  margin: 6px 0;
+}
+
 .tree-row.is-card .tree-name {
   font-size: 15px;
 }
@@ -1426,10 +1485,6 @@ select.input,
   border-radius: inherit;
 }
 
-.flashcard:focus-visible {
-  box-shadow: var(--shadow), 0 0 0 3px var(--accent-soft);
-}
-
 .flashcard.is-revealed {
   cursor: grab;
   -webkit-user-select: none;
@@ -1484,7 +1539,6 @@ select.input,
   text-transform: uppercase;
   text-align: center;
   color: var(--text-muted);
-  opacity: 0.8;
 }
 
 .fc-divider {
@@ -1530,13 +1584,13 @@ select.input,
 .swipe-hint.is-no {
   justify-content: flex-end;
   background: var(--danger-soft);
-  color: var(--danger);
+  color: var(--danger-text);
 }
 
 .swipe-hint.is-yes {
   justify-content: flex-start;
   background: var(--success-soft);
-  color: var(--success);
+  color: var(--success-text);
 }
 
 .swipe-label {
@@ -1666,12 +1720,12 @@ select.input,
 
 .btn-answer.is-no {
   background: var(--danger-soft);
-  color: var(--danger);
+  color: var(--danger-text);
 }
 
 .btn-answer.is-yes {
   background: var(--success-soft);
-  color: var(--success);
+  color: var(--success-text);
 }
 
 /* End of session */
@@ -1699,7 +1753,7 @@ select.input,
   height: 64px;
   border-radius: 50%;
   background: var(--success-soft);
-  color: var(--success);
+  color: var(--success-text);
 }
 
 .end-title {
@@ -1709,7 +1763,7 @@ select.input,
 }
 
 .end-check {
-  color: var(--success);
+  color: var(--success-text);
 }
 
 .end-stats {
@@ -1823,7 +1877,7 @@ select.input,
   font-size: 17px;
   resize: none;
   overflow: hidden;
-  background: var(--bg);
+  background-color: var(--bg);
 }
 
 .media-box {
@@ -1954,12 +2008,13 @@ select.input,
   background: var(--bg);
 }
 
+/* background-color, not the shorthand: a <select> keeps its chevron (background-image). */
 .data-section .input {
-  background: var(--bg);
+  background-color: var(--bg);
 }
 
 .data-section .input:focus {
-  background: var(--surface);
+  background-color: var(--surface);
 }
 
 .data-title {
@@ -2067,7 +2122,7 @@ select.input,
   align-items: center;
   gap: 6px;
   min-height: 40px;
-  color: var(--danger);
+  color: var(--danger-text);
   font-weight: 600;
   cursor: pointer;
   list-style: none;
@@ -2087,6 +2142,24 @@ select.input,
 
 .warnings li + li {
   margin-top: 4px;
+}
+
+.warnings li {
+  overflow-wrap: anywhere;
+}
+
+/* Neutral list (versos replaced by the import), same layout as the warnings. */
+.warnings.is-info summary {
+  color: var(--text);
+}
+
+.warnings.is-info strong {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.change-old {
+  text-decoration: line-through;
 }
 
 .app-footer {
@@ -2166,7 +2239,7 @@ select.input,
 }
 
 .dialog-form .input {
-  background: var(--bg);
+  background-color: var(--bg);
 }
 
 .dialog-actions {
@@ -2265,7 +2338,7 @@ select.input,
 
 .sheet-item.is-danger,
 .sheet-item.is-danger .icon {
-  color: var(--danger);
+  color: var(--danger-text);
 }
 
 .sheet-cancel {

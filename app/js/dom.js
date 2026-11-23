@@ -131,6 +131,16 @@ export function formatDayFr(dayKey) {
   }
 }
 
+/**
+ * French typography for UI text: a non-breaking space after « and before » ? ! : ; so these signs
+ * never start or end a line on their own. For display only (never applied to stored data).
+ */
+export function frSpaces(s) {
+  return String(s ?? '')
+    .replace(/« /g, '«\u00A0')
+    .replace(/ (?=[»?!:;])/g, '\u00A0');
+}
+
 /** Accent-insensitive search key. */
 export function searchKey(s) {
   return String(s ?? '')

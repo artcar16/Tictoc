@@ -4,9 +4,27 @@ import * as db from '../db.js';
 import { studyDay, plural } from '../util.js';
 import { h } from '../dom.js';
 import { icon } from './icons.js';
-import { pageHead, emptyState, promptDialog, guard } from './components.js';
+import { pageHead, emptyState, promptDialog, guard, isIOSBrowserTab, iosTabNotice } from './components.js';
 import { navigate } from './router.js';
 import { progressMap, summarizeMethod } from './stats.js';
+
+const IOS_NOTICE_KEY = 'recto.iosNoticeHidden'; // per device: « Masquer » on the Safari-tab notice
+
+function iosNoticeHidden() {
+  try {
+    return localStorage.getItem(IOS_NOTICE_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+function hideIosNotice() {
+  try {
+    localStorage.setItem(IOS_NOTICE_KEY, '1');
+  } catch {
+    /* the notice comes back next time */
+  }
+}
 
 function todayLabel() {
   try {
@@ -78,13 +96,15 @@ export async function renderMethods(root, ctx) {
   newBtn.addEventListener('click', guard(createMethodFlow));
 
   root.append(pageHead({ title: 'Réviser', subtitle: todayLabel() }));
+  // Still in a Safari tab on iPhone: its data is separate from the installed app and can be erased.
+  if (isIOSBrowserTab() && !iosNoticeHidden()) root.append(iosTabNotice({ hasCards: cards.length > 0, onDismiss: hideIosNotice }));
 
   if (!methods.length) {
-    const actions = [newBtn];
+    // No cards yet: importing them is the first step, so it is the main button.
+    let actions = [newBtn];
     if (!cards.length) {
-      actions.push(
-        h('a', { class: 'btn btn-secondary btn-block', href: '#/data' }, icon('upload', { size: 20 }), 'Importer des cartes'),
-      );
+      newBtn.className = 'btn btn-secondary btn-block';
+      actions = [h('a', { class: 'btn btn-primary btn-block btn-lg', href: '#/data' }, icon('upload', { size: 20 }), 'Importer des cartes'), newBtn];
     }
     root.append(
       emptyState({

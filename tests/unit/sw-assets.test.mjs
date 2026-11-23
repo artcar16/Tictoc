@@ -148,3 +148,40 @@ test('JS modules only import precached files', () => {
   }
   assert.deepEqual(problems, [], `modules reference files that are not in ASSETS:\n  ${problems.join('\n  ')}`);
 });
+
+/** './js/…' modules that `fromAsset` imports statically (import … from / export … from / import '…'). */
+function staticImports(fromAsset) {
+  const code = readFileSync(join(APP_DIR, fromAsset.slice(2)), 'utf8');
+  const refs = [
+    ...code.matchAll(/\bfrom\s*["'](\.{1,2}\/[^"']+)["']/g),
+    ...code.matchAll(/\bimport\s*["'](\.{1,2}\/[^"']+)["']/g),
+  ].map((m) => m[1]);
+  return refs.filter((ref) => ref.split(/[?#]/)[0].endsWith('.js')).map((ref) => resolveRef(fromAsset, ref));
+}
+
+test('index.html modulepreloads exactly the modules app.js imports (no import waterfall)', () => {
+  const html = readFileSync(join(APP_DIR, 'index.html'), 'utf8');
+  const preloaded = [...html.matchAll(/<link\b[^>]*\brel\s*=\s*["']modulepreload["'][^>]*>/g)].map((m) => {
+    const href = /\bhref\s*=\s*["']([^"']+)["']/.exec(m[0]);
+    assert.ok(href, `modulepreload without href: ${m[0]}`);
+    return resolveRef('./index.html', href[1]);
+  });
+  const reachable = new Set();
+  const queue = ['./js/app.js'];
+  while (queue.length) {
+    const asset = queue.pop();
+    if (reachable.has(asset) || !existsSync(join(APP_DIR, asset.slice(2)))) continue;
+    reachable.add(asset);
+    queue.push(...staticImports(asset));
+  }
+  reachable.delete('./js/app.js'); // already fetched by <script type="module" src="./js/app.js">
+  const missing = [...reachable].filter((m) => !preloaded.includes(m)).sort();
+  const extra = preloaded.filter((m) => !reachable.has(m));
+  assert.deepEqual(
+    missing,
+    [],
+    `add to app/index.html (after the app.js script):\n  ${missing.map((m) => `<link rel="modulepreload" href="${m}" />`).join('\n  ')}`,
+  );
+  assert.deepEqual(extra, [], `app/index.html preloads modules app.js does not import:\n  ${extra.join('\n  ')}`);
+  assert.equal(new Set(preloaded).size, preloaded.length, 'duplicate modulepreload in app/index.html');
+});
