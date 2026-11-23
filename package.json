@@ -1,0 +1,16 @@
+{
+  "name": "recto",
+  "version": "1.0.0",
+  "description": "Recto — flashcards simples pour réviser ses cours sur le téléphone (PWA hors ligne).",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node scripts/serve.mjs",
+    "test": "node --test \"tests/unit/*.test.mjs\"",
+    "e2e": "node tests/e2e/run.mjs",
+    "icons": "node scripts/make-icons.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

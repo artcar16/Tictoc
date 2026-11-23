@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <title>Recto</title>
+  <!-- Background: rounded square. scripts/make-icons.mjs turns it full-bleed for the maskable/Apple variants. -->
+  <rect id="bg" x="0" y="0" width="512" height="512" rx="112" fill="#3b5bdb"/>
+  <!-- Mark: two offset flashcards. Bounding box is centred on (256, 256) so it can be scaled in place. -->
+  <g id="mark" fill="none" stroke="#ffffff" stroke-width="22" stroke-linejoin="round" stroke-linecap="round">
+    <rect x="160" y="140" width="248" height="176" rx="28" stroke-opacity="0.55"/>
+    <rect x="104" y="196" width="248" height="176" rx="28" fill="#3b5bdb"/>
+    <path d="M168 266h120M188 306h80"/>
+  </g>
+</svg>
